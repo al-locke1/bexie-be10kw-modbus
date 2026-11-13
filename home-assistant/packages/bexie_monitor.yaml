@@ -10,7 +10,8 @@
 #     are the ones that profile creates with the device named "Inverter"
 #     (sensor.inverter_battery_soc, select.inverter_work_mode and so on).
 #   - The "known-good" values (the exp dictionary, repeated in each template) are
-#     from one BE10KW-1PH system. Change them to match yours.
+#     from one BE10KW-1PH system, including its firmware versions. Change them to
+#     match yours, or the check will report differences straight away.
 #   - Alerts go through script.house_notify (fields: title, message, tag) and the
 #     notify service named in input_text.security_notify_service. Replace both
 #     with your own notification.
@@ -29,6 +30,10 @@
 #   counting register 0x2001 or the car's 5 kW limit), read time.
 #   The settings HA itself controls (work mode, grid charge, charge target, the
 #   car's 5 kW limit) are left out of the comparison.
+#   The known-good values include capacity mode (0 = SOC) and the firmware versions,
+#   so a revert or a firmware update is flagged even if HA restarts in between.
+#   After a planned firmware update, put the new versions in 'firmware_block' and
+#   'ems_firmware' below (13 Nov 2026: EMS 01140310004-07261008).
 #   Fire event bexie_monitor_refresh (Developer tools > Events) to read it now.
 #
 # Checks (binary_sensor.check_*, so they show in sensor.system_checks too), each
@@ -166,6 +171,9 @@ template:
             'discharge_end_pct': 15, 'off_grid': 1, 'off_grid_startup_pct': 25,
             'max_discharge_a': 210.0, 'max_charge_a': 210.0, 'production_type': 3,
             'meter_type': 15, 'meter_location': 0, 'feed_in_grid': 1, 'power_limit_function': 3,
+            'capacity_mode': 0,
+            'firmware_block': '05100101120110000-0626091701140110001-07260917',
+            'ems_firmware': '01140310004-07261008',
           } %}
           {%- set ns = namespace(diff=[]) %}
           {%- if ok %}
@@ -236,6 +244,9 @@ template:
               'discharge_end_pct': 15, 'off_grid': 1, 'off_grid_startup_pct': 25,
               'max_discharge_a': 210.0, 'max_charge_a': 210.0, 'production_type': 3,
               'meter_type': 15, 'meter_location': 0, 'feed_in_grid': 1, 'power_limit_function': 3,
+              'capacity_mode': 0,
+              'firmware_block': '05100101120110000-0626091701140110001-07260917',
+              'ems_firmware': '01140310004-07261008',
             } %}
             {%- set ns = namespace(diff=[]) %}
             {%- if ok %}
@@ -305,6 +316,9 @@ template:
               'discharge_end_pct': 15, 'off_grid': 1, 'off_grid_startup_pct': 25,
               'max_discharge_a': 210.0, 'max_charge_a': 210.0, 'production_type': 3,
               'meter_type': 15, 'meter_location': 0, 'feed_in_grid': 1, 'power_limit_function': 3,
+              'capacity_mode': 0,
+              'firmware_block': '05100101120110000-0626091701140110001-07260917',
+              'ems_firmware': '01140310004-07261008',
             } %}
             {%- set ns = namespace(diff=[]) %}
             {%- if ok %}
@@ -374,6 +388,9 @@ template:
               'discharge_end_pct': 15, 'off_grid': 1, 'off_grid_startup_pct': 25,
               'max_discharge_a': 210.0, 'max_charge_a': 210.0, 'production_type': 3,
               'meter_type': 15, 'meter_location': 0, 'feed_in_grid': 1, 'power_limit_function': 3,
+              'capacity_mode': 0,
+              'firmware_block': '05100101120110000-0626091701140110001-07260917',
+              'ems_firmware': '01140310004-07261008',
             } %}
             {%- set ns = namespace(diff=[]) %}
             {%- if ok %}
@@ -450,6 +467,9 @@ template:
               'discharge_end_pct': 15, 'off_grid': 1, 'off_grid_startup_pct': 25,
               'max_discharge_a': 210.0, 'max_charge_a': 210.0, 'production_type': 3,
               'meter_type': 15, 'meter_location': 0, 'feed_in_grid': 1, 'power_limit_function': 3,
+              'capacity_mode': 0,
+              'firmware_block': '05100101120110000-0626091701140110001-07260917',
+              'ems_firmware': '01140310004-07261008',
             } %}
             {%- set ns = namespace(diff=[]) %}
             {%- if ok %}
@@ -519,6 +539,9 @@ template:
               'discharge_end_pct': 15, 'off_grid': 1, 'off_grid_startup_pct': 25,
               'max_discharge_a': 210.0, 'max_charge_a': 210.0, 'production_type': 3,
               'meter_type': 15, 'meter_location': 0, 'feed_in_grid': 1, 'power_limit_function': 3,
+              'capacity_mode': 0,
+              'firmware_block': '05100101120110000-0626091701140110001-07260917',
+              'ems_firmware': '01140310004-07261008',
             } %}
             {%- set ns = namespace(diff=[]) %}
             {%- if ok %}
@@ -588,6 +611,9 @@ template:
               'discharge_end_pct': 15, 'off_grid': 1, 'off_grid_startup_pct': 25,
               'max_discharge_a': 210.0, 'max_charge_a': 210.0, 'production_type': 3,
               'meter_type': 15, 'meter_location': 0, 'feed_in_grid': 1, 'power_limit_function': 3,
+              'capacity_mode': 0,
+              'firmware_block': '05100101120110000-0626091701140110001-07260917',
+              'ems_firmware': '01140310004-07261008',
             } %}
             {%- set ns = namespace(diff=[]) %}
             {%- if ok %}
@@ -645,7 +671,8 @@ template:
           message: >-
             {{ (state_attr('sensor.inverter_settings', 'differences') or []) | join('; ') }}.
             Something other than Home Assistant has changed the inverter (HA never writes these).
-            If it wasn't Bexie, check the Bexie app.
+            If it wasn't Bexie, check the Bexie app. If it's a firmware update, put the new
+            versions in bexie_monitor.yaml to clear this.
 
       - name: Check inverter fault
         unique_id: check_inverter_fault

@@ -71,7 +71,7 @@ A read-only check every 15 minutes covers most problems seen so far. The working
 **Alerts that have proved useful**
 
 - Any setting that changes between reads, including firmware. This catches remote changes by the manufacturer.
-- Known-good values drifting, for example the battery type, charge limits or meter settings.
+- Known-good values drifting, for example the battery type, capacity mode, charge limits, meter settings or firmware versions. Because these are fixed values, a change is caught even if Home Assistant restarts between reads.
 - Any fault bit or error code.
 - The battery not taking spare solar when it is below full.
 - Slow grid charging during the cheap-rate window.
