@@ -1,0 +1,707 @@
+# =============================================================================
+# PREDBAT TO BEXIE BRIDGE  ·  Save as /config/packages/predbat_bexie.yaml
+#
+# Predbat plans the battery from tomorrow's solar forecast, your usage history and
+# the Octopus Go rates. It cannot drive the Bexie directly, so it calls
+# script.bexie_battery_control (see predbat-apps.yaml) and this package turns
+# each request into the inverter settings proven on 24 Sept 2026:
+#
+#   Predbat asks      Inverter is set to
+#   charge to N%      End SOC N, Work Mode "Back-up", Grid Charge on
+#   hold              End SOC = current SOC, "Back-up", Grid Charge on
+#                     (battery neither charges nor discharges, house on grid)
+#   hold, battery     "Self Use" (battery runs the house) until the battery falls to
+#   above Predbat's   Predbat's charge limit, then hold there. Predbat plans a hold
+#   charge limit      below the current level as a floor (e.g. keep 61% for a saving
+#                     session), but it can only send "hold", so the floor comes from
+#                     predbat.best_charge_limit. Added 26 Oct 2026.
+#   stop              Grid Charge off, Work Mode "Self Use" (normal running)
+#
+# Cheap rate rule (4 Nov 2026): while import is cheap (under 20p, or 00:30 to
+# 05:30 if the rate isn't known), the battery only ever charges or rests. A
+# "stop" or a floor from Predbat becomes a hold: the house runs on 9.5p grid
+# power and the battery keeps what it has. Stops the charge, run down, charge
+# again pattern inside the cheap window, which only adds losses and wear.
+# From the day rate the normal rules apply (Self Use, floors), and the guard
+# still lets go 10 minutes into the day rate.
+#
+# Nothing here acts until input_boolean.bexie_auto_control ("Predbat controls the
+# battery") is turned on. Turn it off at any time to take manual control.
+#
+# Safety nets, every 5 minutes and at start-up, only while that switch is on:
+#   - Predbat has not updated its plan for 30 min, or is in Monitor mode:
+#     back to Self Use.
+#   - Still charging or holding 10 min into the day rate (above 20p): back to
+#     Self Use, unless the car hold is active or Predbat's own status says it is
+#     charging (an Octopus free Power Up hour still shows the normal rate here).
+#   - Inverter not in the state the bridge last set (changed by hand, a write that
+#     did not land, a restart): set again.
+# Car hold: the car never runs from the battery.
+# Since 28 Oct 2026 the Sync Energy charger is in Home Assistant (OCPP, see
+# ev_charging.yaml), so "car charging" is the charger's own status, within
+# seconds. Whenever the car charges from the grid (overnight, or "Charge now"),
+# at any time of day, the battery is held so the car runs from the grid. The
+# only exception is charging on spare solar (binary_sensor.ev_solar_charging),
+# where ev_charging.yaml keeps the car's current to what is spare and stops it
+# if the battery would have to help.
+# This needs no switch: with the charger online it always applies.
+# If the charger is offline, the old fallback applies (only when
+# input_boolean.bexie_car_hold is on): over 5 kW of house load for
+# 5 minutes means the car has started, under 3 kW for 5 minutes means it has
+# finished, and the hold only applies inside the car hold hours
+# (input_datetime.bexie_car_hold_from / _to, 21:00 to 07:00 if left unset).
+# This works whatever Predbat is doing at the time. When the car finishes,
+# Predbat's own last request is put back.
+# The car's power (the charger's reading, or the load above the base load when
+# the charger is offline) is integrated into sensor.car_energy_estimate for
+# Predbat (car_charging_energy), so it can strip the car out of its usage history.
+# Octopus free hours: binary_sensor.octopus_free_hour reads the free session / Power Up
+# events Predbat plans around. The phone gets a message when one is booked and when it
+# starts, and the dashboard banners say "Free hour" instead of "Charging from grid".
+#
+# BEFORE YOU USE THIS
+#   - This is one household's working setup, shared as an example. It is tied to
+#     an Octopus Go tariff (cheap 00:30 to 05:30, 20p threshold), a 10% minimum
+#     and an OCPP car charger. Read it through and adapt it; do not install blind.
+#   - It refers to things that are not in this repo: predbat-apps.yaml (Predbat's
+#     own config, which calls script.bexie_battery_control), ev_charging.yaml
+#     (binary_sensor.ev_charger_charging, binary_sensor.ev_solar_charging,
+#     sensor.ev_charging_power), sensor.octopus_import_rate and
+#     script.house_notify (fields: title, message, tag).
+#   - The inverter entities are the ones the ha-solarman Bexie profile creates
+#     with the device named "Inverter".
+# =============================================================================
+
+input_boolean:
+  bexie_auto_control:
+    name: Predbat controls the battery
+    icon: mdi:robot
+  bexie_car_hold:
+    name: Car hold when the charger is offline (load guess)
+    icon: mdi:car-electric
+  bexie_car_hold_active:
+    name: Car hold active
+    icon: mdi:car-clock
+
+input_datetime:
+  bexie_car_hold_from:
+    name: Car hold from
+    has_date: false
+    has_time: true
+  bexie_car_hold_to:
+    name: Car hold until
+    has_date: false
+    has_time: true
+
+input_select:
+  bexie_battery_mode:
+    name: Battery bridge mode
+    icon: mdi:battery-sync
+    options:
+      - Normal
+      - Charging
+      - Holding
+      - Floor
+
+input_number:
+  bexie_battery_target:
+    name: Battery bridge target
+    min: 10
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+
+input_text:
+  bexie_predbat_request:
+    name: Last Predbat battery request
+    max: 32
+  octopus_free_hour_notified:
+    name: Last free hour notified
+    max: 64
+
+script:
+  bexie_battery_control:
+    alias: Bexie - battery control (called by Predbat)
+    icon: mdi:battery-sync
+    mode: queued
+    max: 20
+    fields:
+      command:
+        description: charge, hold, floor or stop (discharge_stop is accepted and ignored)
+        example: charge
+      target_soc:
+        description: Charge target in % (charge only)
+        example: 85
+      source:
+        description: predbat (default), car or guard
+        example: predbat
+    sequence:
+      - variables:
+          cmd: "{{ (command | default('stop') | string | lower | trim) }}"
+          src: "{{ source | default('predbat') }}"
+          soc: "{{ states('sensor.inverter_battery_soc') | float(0) }}"
+          tgt: "{{ [[target_soc | default(0) | int(0), 10] | max, 100] | min }}"
+          hold_at: "{{ [(states('sensor.inverter_battery_soc') | float(0)) | round(0, 'floor') | int, 10] | max }}"
+          # a Predbat "stop" while the car is charging in the car hold hours becomes a hold
+          car_take: >-
+            {{ src == 'predbat' and cmd == 'stop'
+               and (is_state('input_boolean.bexie_car_hold_active', 'on') or is_state('binary_sensor.car_hold_wanted', 'on')) }}
+          # Predbat's charge limit for the window it is in. A hold with the battery more
+          # than 2 points above it is a floor: run normally down to the limit, then hold.
+          lim: "{{ states('predbat.best_charge_limit') | float(-1) }}"
+          floor_hold: >-
+            {{ cmd == 'hold' and src in ['predbat', 'guard'] and not car_take
+               and not is_state('input_boolean.bexie_car_hold_active', 'on')
+               and lim >= 10 and soc > lim + 2 }}
+          # cheap import: the battery may charge or rest, but never runs the house
+          rate_now: "{{ states('sensor.octopus_import_rate') | float(-1) }}"
+          cheap: "{{ (rate_now < 20) if rate_now >= 0 else ('00:30' <= now().strftime('%H:%M') < '05:30') }}"
+          # (a guard "stop" is a safety fallback, e.g. Predbat stalled, so it still goes to normal running)
+          cheap_take: "{{ cheap and ((src == 'predbat' and cmd == 'stop') or floor_hold) }}"
+          eff: "{{ 'hold' if (car_take or cheap_take) else 'floor' if floor_hold else cmd }}"
+          floor_at: "{{ (lim | round(0, 'ceil') | int) if floor_hold else tgt }}"
+      # remember what Predbat last asked for, so the car hold and the guard can put it back
+      - if:
+          - condition: template
+            value_template: "{{ src == 'predbat' and cmd in ['charge', 'hold', 'stop'] }}"
+        then:
+          - action: input_text.set_value
+            target:
+              entity_id: input_text.bexie_predbat_request
+            data:
+              value: "{{ cmd }}:{{ target_soc | default(0) | int(0) }}"
+      - if:
+          - condition: state
+            entity_id: input_boolean.bexie_auto_control
+            state: "off"
+        then:
+          - stop: Predbat control is switched off, inverter left as it is
+      - if:
+          - condition: template
+            value_template: "{{ car_take }}"
+        then:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.bexie_car_hold_active
+      - choose:
+          - conditions: "{{ eff in ['charge', 'hold'] }}"
+            sequence:
+              - variables:
+                  end_soc: "{{ tgt if eff == 'charge' else hold_at }}"
+              - action: input_number.set_value
+                target:
+                  entity_id: input_number.bexie_battery_target
+                data:
+                  value: "{{ end_soc }}"
+              - action: input_select.select_option
+                target:
+                  entity_id: input_select.bexie_battery_mode
+                data:
+                  option: "{{ 'Charging' if eff == 'charge' else 'Holding' }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ states('number.inverter_grid_charge_end_soc') | int(-1) != end_soc | int }}"
+                then:
+                  - action: number.set_value
+                    target:
+                      entity_id: number.inverter_grid_charge_end_soc
+                    data:
+                      value: "{{ end_soc }}"
+                    continue_on_error: true
+              - if:
+                  - condition: template
+                    value_template: "{{ not is_state('select.inverter_work_mode', 'Back-up') }}"
+                then:
+                  - action: select.select_option
+                    target:
+                      entity_id: select.inverter_work_mode
+                    data:
+                      option: Back-up
+                    continue_on_error: true
+                  - delay: "00:00:10"
+              - if:
+                  - condition: template
+                    value_template: "{{ not is_state('switch.inverter_grid_charge', 'on') }}"
+                then:
+                  - action: switch.turn_on
+                    target:
+                      entity_id: switch.inverter_grid_charge
+                    continue_on_error: true
+          - conditions: "{{ eff in ['stop', 'floor'] }}"
+            sequence:
+              - if:
+                  - condition: template
+                    value_template: "{{ eff == 'floor' }}"
+                then:
+                  - action: input_number.set_value
+                    target:
+                      entity_id: input_number.bexie_battery_target
+                    data:
+                      value: "{{ [floor_at | int, 10] | max }}"
+              - action: input_select.select_option
+                target:
+                  entity_id: input_select.bexie_battery_mode
+                data:
+                  option: "{{ 'Floor' if eff == 'floor' else 'Normal' }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ not is_state('switch.inverter_grid_charge', 'off') }}"
+                then:
+                  - action: switch.turn_off
+                    target:
+                      entity_id: switch.inverter_grid_charge
+                    continue_on_error: true
+                  - delay: "00:00:10"
+              - if:
+                  - condition: template
+                    value_template: "{{ not is_state('select.inverter_work_mode', 'Self Use') }}"
+                then:
+                  - action: select.select_option
+                    target:
+                      entity_id: select.inverter_work_mode
+                    data:
+                      option: Self Use
+                    continue_on_error: true
+        # anything else (discharge_stop) needs no action: Predbat is not allowed to export
+
+automation:
+  - id: bexie_battery_guard
+    alias: Bexie - battery bridge guard
+    description: Keeps the inverter in step with the bridge and lets go if Predbat stops or the cheap rate ends.
+    mode: single
+    triggers:
+      - trigger: time_pattern
+        minutes: "/5"
+      - trigger: homeassistant
+        event: start
+      - trigger: state
+        entity_id: select.predbat_mode
+      - trigger: state
+        entity_id: input_boolean.bexie_auto_control
+        to: "on"
+      # catches the battery reaching a floor promptly
+      - trigger: state
+        entity_id: sensor.inverter_battery_soc
+    actions:
+      - delay: "00:00:15"
+      - variables:
+          mode: "{{ states('input_select.bexie_battery_mode') }}"
+          soc: "{{ states('sensor.inverter_battery_soc') | float(-1) }}"
+          floor_at: "{{ states('input_number.bexie_battery_target') | float(0) }}"
+          car: "{{ is_state('input_boolean.bexie_car_hold_active', 'on') }}"
+          inv_forced: "{{ is_state('select.inverter_work_mode', 'Back-up') and is_state('switch.inverter_grid_charge', 'on') }}"
+          inv_normal: "{{ is_state('select.inverter_work_mode', 'Self Use') and is_state('switch.inverter_grid_charge', 'off') }}"
+          pb_age: "{{ ((as_timestamp(now()) - as_timestamp(state_attr('predbat.status', 'last_updated'), 0)) / 60) | round(0) }}"
+          pb_ok: "{{ pb_age < 30 and states('select.predbat_mode') not in ['Monitor', 'unknown', 'unavailable'] }}"
+          rate: "{{ states('sensor.octopus_import_rate') | float(-1) }}"
+          peak: "{{ (rate > 20) if rate >= 0 else not ('00:30' <= now().strftime('%H:%M') < '05:30') }}"
+          peak_mins: "{{ ((as_timestamp(now()) - as_timestamp(states.sensor.octopus_import_rate.last_changed, 0)) / 60) | round(0) if rate >= 0 and states.sensor.octopus_import_rate is not none else 999 }}"
+          mode_mins: "{{ ((as_timestamp(now()) - as_timestamp(states.input_select.bexie_battery_mode.last_changed, 0)) / 60) | round(0) if states.input_select.bexie_battery_mode is not none else 0 }}"
+          request: "{{ states('input_text.bexie_predbat_request') }}"
+          # Predbat itself says it is charging (an Octopus free Power Up hour shows as day rate here)
+          pb_charging: "{{ pb_ok and 'charg' in states('predbat.status') | lower }}"
+      - condition: template
+        value_template: "{{ is_state('input_boolean.bexie_auto_control', 'on') and has_value('select.inverter_work_mode') and has_value('switch.inverter_grid_charge') }}"
+      - choose:
+          - alias: Predbat stopped or switched to Monitor
+            conditions: "{{ mode != 'Normal' and not car and not pb_ok }}"
+            sequence:
+              - action: script.bexie_battery_control
+                data:
+                  command: stop
+                  source: guard
+              - action: script.turn_on
+                target:
+                  entity_id: script.house_notify
+                data:
+                  variables:
+                    title: Battery
+                    message: "Predbat {{ 'is in Monitor mode' if states('select.predbat_mode') == 'Monitor' else 'has not updated for ' ~ pb_age ~ ' min' }}, so the battery is back on normal running."
+                    tag: bexie-bridge
+                continue_on_error: true
+          - alias: Still forcing the battery on the day rate
+            conditions: "{{ mode != 'Normal' and not (car and mode == 'Holding') and peak and peak_mins >= 10 and mode_mins >= 10 and not pb_charging and not is_state('binary_sensor.octopus_free_hour', 'on') }}"
+            sequence:
+              - action: script.bexie_battery_control
+                data:
+                  command: stop
+                  source: guard
+              - action: script.turn_on
+                target:
+                  entity_id: script.house_notify
+                data:
+                  variables:
+                    title: Battery
+                    message: "The battery was still {{ mode | lower }} at {{ rate | round(1) }}p, so it is back on normal running."
+                    tag: bexie-bridge
+                continue_on_error: true
+          - alias: Battery has run down to Predbat's floor, hold it there
+            conditions: "{{ mode == 'Floor' and 0 <= soc <= floor_at + 0.5 }}"
+            sequence:
+              - action: script.bexie_battery_control
+                data:
+                  command: hold
+                  source: floor
+          - alias: Predbat hold set before the floor rule, but its limit is well below the battery
+            conditions: >-
+              {{ mode == 'Holding' and not car and request.startswith('hold')
+                 and states('predbat.best_charge_limit') | float(-1) >= 10
+                 and soc > states('predbat.best_charge_limit') | float(0) + 2 }}
+            sequence:
+              - action: script.bexie_battery_control
+                data:
+                  command: hold
+                  source: guard
+          - alias: Inverter not running normally above the floor
+            conditions: "{{ mode == 'Floor' and not inv_normal }}"
+            sequence:
+              - action: script.bexie_battery_control
+                data:
+                  command: floor
+                  target_soc: "{{ floor_at | int }}"
+                  source: guard
+          - alias: Inverter not charging or holding when it should be
+            conditions: "{{ mode in ['Charging', 'Holding'] and (not inv_forced or states('number.inverter_grid_charge_end_soc') | int(-1) != states('input_number.bexie_battery_target') | int(-2)) }}"
+            sequence:
+              - action: script.bexie_battery_control
+                data:
+                  command: "{{ 'charge' if mode == 'Charging' else 'hold' }}"
+                  target_soc: "{{ states('input_number.bexie_battery_target') | int(90) }}"
+                  source: guard
+          - alias: Inverter not on normal running when it should be
+            conditions: "{{ mode == 'Normal' and not inv_normal }}"
+            sequence:
+              - action: script.bexie_battery_control
+                data:
+                  command: stop
+                  source: guard
+
+  - id: bexie_car_hold_check
+    alias: Bexie - hold the battery while the car charges
+    description: Engages or releases the car hold. Runs whenever the car, the hours, the bridge or the switches change, and every 5 minutes.
+    mode: queued
+    max: 5
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.car_hold_wanted
+      - trigger: state
+        entity_id: input_select.bexie_battery_mode
+        to: Normal
+      - trigger: state
+        entity_id:
+          - input_boolean.bexie_car_hold
+          - input_boolean.bexie_auto_control
+      - trigger: time_pattern
+        minutes: "/5"
+      - trigger: homeassistant
+        event: start
+    actions:
+      - variables:
+          wanted: "{{ is_state('binary_sensor.car_hold_wanted', 'on') and is_state('input_boolean.bexie_auto_control', 'on') }}"
+          active: "{{ is_state('input_boolean.bexie_car_hold_active', 'on') }}"
+          mode: "{{ states('input_select.bexie_battery_mode') }}"
+          req: "{{ states('input_text.bexie_predbat_request') }}"
+          last: "{{ req.split(':')[0] if ':' in req else 'stop' }}"
+          last_soc: "{{ req.split(':')[1] | int(0) if ':' in req else 0 }}"
+          cheap: "{{ '00:30' <= now().strftime('%H:%M') < '05:30' }}"
+      - choose:
+          # car charging and the battery is running normally: hold it
+          - conditions: "{{ wanted and mode in ['Normal', 'Floor'] }}"
+            sequence:
+              - action: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.bexie_car_hold_active
+              - action: script.bexie_battery_control
+                data:
+                  command: hold
+                  source: car
+              - action: script.turn_on
+                target:
+                  entity_id: script.house_notify
+                data:
+                  variables:
+                    title: Battery
+                    tag: car-hold
+                    message: "Car charging detected (about {{ (states('sensor.car_power_estimate') | float(0) / 1000) | round(1) }} kW). The battery is held so the car runs from the grid."
+                continue_on_error: true
+          # car charging while Predbat is already charging or holding: nothing to do yet,
+          # but mark it so a Predbat stop is turned into a hold
+          - conditions: "{{ wanted and not active }}"
+            sequence:
+              - action: input_boolean.turn_on
+                target:
+                  entity_id: input_boolean.bexie_car_hold_active
+          # car finished, the hours ended, or car hold switched off: give the battery back to Predbat
+          - conditions: "{{ active and not wanted }}"
+            sequence:
+              - action: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.bexie_car_hold_active
+              - action: script.bexie_battery_control
+                data:
+                  command: "{{ last if last in ['charge', 'hold'] and cheap else 'stop' }}"
+                  target_soc: "{{ last_soc }}"
+                  source: car
+
+  # ---- Octopus free hours: tell the phone when one is booked and when it starts
+  - id: octopus_free_hour_booked
+    alias: Octopus free hour - booked
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.octopus_free_hour
+        attribute: times
+      - trigger: homeassistant
+        event: start
+    conditions:
+      - condition: template
+        value_template: >-
+          {%- set n = (state_attr('binary_sensor.octopus_free_hour', 'times') or {}).get('next_start') %}
+          {{ n is not none and n != states('input_text.octopus_free_hour_notified') }}
+    actions:
+      - variables:
+          times: "{{ state_attr('binary_sensor.octopus_free_hour', 'times') }}"
+          a: "{{ as_timestamp(times.next_start) }}"
+          b: "{{ as_timestamp(times.next_end) }}"
+          in_control: >-
+            {{ is_state('input_boolean.bexie_auto_control', 'on')
+               and states('select.predbat_mode') not in ['Monitor', 'unknown', 'unavailable'] }}
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.octopus_free_hour_notified
+        data:
+          value: "{{ times.next_start }}"
+      - action: script.turn_on
+        target:
+          entity_id: script.house_notify
+        data:
+          variables:
+            title: Free electricity booked
+            message: >-
+              Octopus free hour {{ a | timestamp_custom('%a %d %b, %H:%M') }} to {{ b | timestamp_custom('%H:%M') }}.
+              {{ 'Predbat will fill the battery then, so the dashboard will show it charging from the grid. It costs nothing.'
+                 if in_control else
+                 'Predbat is not in control right now (Monitor or manual), so the battery will not use it unless you switch Predbat back to Control charge.' }}
+            tag: octopus-free-hour
+        continue_on_error: true
+
+  - id: octopus_free_hour_started
+    alias: Octopus free hour - started
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.octopus_free_hour
+        from: "off"
+        to: "on"
+    actions:
+      - action: script.turn_on
+        target:
+          entity_id: script.house_notify
+        data:
+          variables:
+            title: Free electricity now
+            message: >-
+              Free until {{ as_timestamp(state_attr('binary_sensor.octopus_free_hour', 'times').end) | timestamp_custom('%H:%M') }}.
+              The battery is charging from the grid at no cost (the rate on screen still shows the normal price).
+              A good time to run the washer or dishwasher.
+            tag: octopus-free-hour
+        continue_on_error: true
+
+  # Predbat stops if Home Assistant restarts under it, and its automatic restart can
+  # come back before Home Assistant is ready, leaving it stuck without a connection.
+  # If Predbat's status has been missing for 10 minutes, restart the Predbat app once.
+  - id: predbat_watchdog
+    alias: Predbat - restart if not connected
+    mode: single
+    triggers:
+      - trigger: homeassistant
+        event: start
+      - trigger: template
+        value_template: "{{ not has_value('predbat.status') }}"
+        for: "00:10:00"
+    actions:
+      - wait_template: "{{ has_value('predbat.status') }}"
+        timeout: "00:10:00"
+        continue_on_timeout: true
+      - condition: template
+        value_template: "{{ not has_value('predbat.status') }}"
+      - action: hassio.app_restart
+        data:
+          app: 6adb4f0d_predbat
+      - action: script.turn_on
+        target:
+          entity_id: script.house_notify
+        data:
+          variables:
+            title: Predbat restarted
+            message: Predbat had lost its connection to Home Assistant, so it has been restarted. The battery plan will be back in a few minutes.
+            tag: predbat-watchdog
+        continue_on_error: true
+
+sensor:
+  # the house's usual base load: the 10th percentile of the last 24 hours
+  - platform: statistics
+    name: House base load
+    unique_id: house_base_load_24h
+    entity_id: sensor.inverter_load_power
+    state_characteristic: percentile
+    percentile: 10
+    max_age:
+      hours: 24
+    sampling_size: 5000
+  # running total of the car's estimated energy, for Predbat's car_charging_energy
+  - platform: integration
+    name: Car energy estimate
+    unique_id: car_energy_estimate
+    source: sensor.car_power_estimate
+    unit_prefix: k
+    unit_time: h
+    method: left
+    round: 3
+    max_sub_interval:
+      minutes: 1
+
+template:
+  - binary_sensor:
+      # On during an Octopus free electricity hour (free session or Power Up), read from
+      # the same Octopus Energy event entities Predbat uses (octopus_free_session).
+      # The import rate sensor still shows the normal rate during these hours, because
+      # Octopus credits the free hour on the bill afterwards.
+      - name: Octopus free hour
+        unique_id: octopus_free_hour
+        icon: "{{ 'mdi:gift' if this.state == 'on' else 'mdi:gift-outline' }}"
+        state: >-
+          {%- set ns = namespace(cur_s=0, cur_e=0, nxt_s=0, nxt_e=0) %}
+          {%- set t = as_timestamp(now()) %}
+          {%- for s in states.event | selectattr('entity_id', 'search', 'octoplus_(free_electricity_session|power_up)_events') %}
+            {%- for ev in (state_attr(s.entity_id, 'events') or []) %}
+              {%- set a = as_timestamp(ev.start, 0) if ev.start is defined else 0 %}
+              {%- set b = as_timestamp(ev.end, 0) if ev.end is defined else 0 %}
+              {%- if a > 0 and b > a and a <= t < b %}
+                {%- set ns.cur_s = a %}{%- set ns.cur_e = b %}
+              {%- elif a > t and (ns.nxt_s == 0 or a < ns.nxt_s) %}
+                {%- set ns.nxt_s = a %}{%- set ns.nxt_e = b %}
+              {%- endif %}
+            {%- endfor %}
+          {%- endfor %}
+          {{ ns.cur_s > 0 }}
+        attributes:
+          times: >-
+            {%- set ns = namespace(cur_s=0, cur_e=0, nxt_s=0, nxt_e=0) %}
+            {%- set t = as_timestamp(now()) %}
+            {%- for s in states.event | selectattr('entity_id', 'search', 'octoplus_(free_electricity_session|power_up)_events') %}
+              {%- for ev in (state_attr(s.entity_id, 'events') or []) %}
+                {%- set a = as_timestamp(ev.start, 0) if ev.start is defined else 0 %}
+                {%- set b = as_timestamp(ev.end, 0) if ev.end is defined else 0 %}
+                {%- if a > 0 and b > a and a <= t < b %}
+                  {%- set ns.cur_s = a %}{%- set ns.cur_e = b %}
+                {%- elif a > t and (ns.nxt_s == 0 or a < ns.nxt_s) %}
+                  {%- set ns.nxt_s = a %}{%- set ns.nxt_e = b %}
+                {%- endif %}
+              {%- endfor %}
+            {%- endfor %}
+            {{ {'start': (ns.cur_s | timestamp_local) if ns.cur_s else none,
+                'end': (ns.cur_e | timestamp_local) if ns.cur_e else none,
+                'next_start': (ns.nxt_s | timestamp_local) if ns.nxt_s else none,
+                'next_end': (ns.nxt_e | timestamp_local) if ns.nxt_e else none} }}
+      - name: Car charging
+        unique_id: car_charging_detected
+        icon: "{{ 'mdi:car-electric' if this.state == 'on' else 'mdi:car-off' }}"
+        device_class: battery_charging
+        # The charger's own status (ev_charging.yaml). If the charger is offline:
+        # starts above 5 kW of house load, stays on until it drops under 3 kW.
+        state: >-
+          {%- set ch = states('binary_sensor.ev_charger_charging') %}
+          {%- if ch in ['on', 'off'] %}{{ ch == 'on' }}
+          {%- else %}
+            {%- set load = states('sensor.inverter_load_power') | float(0) %}
+            {{ load >= 5000 or (this.state == 'on' and load >= 3000) }}
+          {%- endif %}
+        delay_on: "{{ '00:00:00' if states('binary_sensor.ev_charger_charging') in ['on', 'off'] else '00:05:00' }}"
+        delay_off: "{{ '00:01:00' if states('binary_sensor.ev_charger_charging') in ['on', 'off'] else '00:05:00' }}"
+        availability: "{{ states('binary_sensor.ev_charger_charging') in ['on', 'off'] or has_value('sensor.inverter_load_power') }}"
+      - name: Car hold wanted
+        unique_id: car_hold_wanted
+        icon: mdi:car-clock
+        state: >-
+          {%- set f = states('input_datetime.bexie_car_hold_from')[:5] %}
+          {%- set t = states('input_datetime.bexie_car_hold_to')[:5] %}
+          {%- if f == t or f in ['unkno', 'unava'] or t in ['unkno', 'unava'] %}{% set f, t = '21:00', '07:00' %}{% endif %}
+          {%- set n = now().strftime('%H:%M') %}
+          {%- set in_hours = (f <= n < t) if f < t else (n >= f or n < t) %}
+          {%- set charger = states('binary_sensor.ev_charger_charging') in ['on', 'off'] %}
+          {#- With the charger online the hold is unconditional: the car never runs from the
+              battery, whatever the switch says. The switch only governs the load-based
+              guess used when the charger is offline. #}
+          {{ is_state('binary_sensor.car_charging', 'on')
+             and ((charger and not is_state('binary_sensor.ev_solar_charging', 'on'))
+                  or (not charger and in_hours and is_state('input_boolean.bexie_car_hold', 'on'))) }}
+  - sensor:
+      - name: Car power estimate
+        unique_id: car_power_estimate
+        unit_of_measurement: W
+        device_class: power
+        state_class: measurement
+        # The charger's own power reading (kW), or, if the charger is offline,
+        # the house load above its usual base load while the car charges.
+        state: >-
+          {#- 1 Nov 2026: use the cleaned figure from ev_charging.yaml. The charger's raw
+              reading sticks at its last value after a charge stops or the charger drops
+              out, which would have told Predbat the car was still drawing 6.7 kW. #}
+          {%- if states('binary_sensor.ev_charger_charging') in ['on', 'off'] and has_value('sensor.ev_charging_power') %}
+            {{ states('sensor.ev_charging_power') | float(0) | round(0) }}
+          {%- else %}
+            {%- set load = states('sensor.inverter_load_power') | float(0) %}
+            {%- set base = states('sensor.house_base_load') | float(800) %}
+            {{ ([load - base, 0] | max) | round(0) if is_state('binary_sensor.car_charging', 'on') else 0 }}
+          {%- endif %}
+        availability: "{{ has_value('sensor.inverter_load_power') or states('binary_sensor.ev_charger_charging') in ['on', 'off'] }}"
+  - sensor:
+      - name: Battery plan
+        unique_id: bexie_battery_plan
+        icon: >-
+          {{ 'mdi:gift' if is_state('input_select.bexie_battery_mode', 'Charging') and is_state('binary_sensor.octopus_free_hour', 'on')
+             else 'mdi:battery-charging' if is_state('input_select.bexie_battery_mode', 'Charging')
+             else 'mdi:battery-lock' if is_state('input_select.bexie_battery_mode', 'Holding')
+             else 'mdi:battery-arrow-down-outline' if is_state('input_select.bexie_battery_mode', 'Floor')
+             else 'mdi:hand-back-right' if is_state('input_boolean.bexie_auto_control', 'off')
+             else 'mdi:battery-clock' if state_attr('predbat.best_charge_start', 'timestamp')
+             else 'mdi:battery-heart-variant' }}
+        state: >-
+          {%- set mode = states('input_select.bexie_battery_mode') %}
+          {%- set tgt = states('input_number.bexie_battery_target') | int(0) %}
+          {%- set soc = states('sensor.inverter_battery_soc') | float(0) | round(0) | int %}
+          {%- set s = as_timestamp(state_attr('predbat.best_charge_start', 'timestamp'), 0) %}
+          {%- set e = as_timestamp(state_attr('predbat.best_charge_end', 'timestamp'), 0) %}
+          {%- set lim = states('predbat.best_charge_limit') | int(0) %}
+          {%- set fh = state_attr('binary_sensor.octopus_free_hour', 'times') or {} %}
+          {%- set fs = as_timestamp(fh.get('next_start'), 0) %}
+          {%- set fe = as_timestamp(fh.get('next_end'), 0) %}
+          {%- if is_state('input_boolean.bexie_auto_control', 'off') %}Manual control, Predbat not driving the battery
+          {%- elif mode == 'Charging' and is_state('binary_sensor.octopus_free_hour', 'on') %}Free hour: charging to {{ tgt }}% until {{ as_timestamp(fh.get('end'), 0) | timestamp_custom('%H:%M') }}
+          {%- elif mode == 'Charging' %}Charging to {{ tgt }}%{{ (' until ' ~ (e | timestamp_custom('%H:%M'))) if e > 0 else '' }}
+          {%- elif mode == 'Holding' %}Holding at {{ tgt }}%{{ ' while the car charges' if is_state('input_boolean.bexie_car_hold_active', 'on') else '' }}
+          {%- elif mode == 'Floor' %}On battery, keeping {{ tgt }}% for later
+          {%- elif s > 0 and lim > 0 %}Next charge {{ s | timestamp_custom('%H:%M') }} to {{ e | timestamp_custom('%H:%M') }}, up to {{ lim }}%{{ ' (free hour)' if fs > 0 and fs <= s < fe else '' }}
+          {%- elif states('predbat.status') in ['unknown', 'unavailable'] %}Predbat not running
+          {%- else %}No grid charge needed{{ ' tonight' if now().hour >= 12 else '' }}
+          {%- endif %}
+        attributes:
+          detail: >-
+            {%- set t = states('sensor.predbat_pv_tomorrow') %}
+            {%- set d = states('sensor.predbat_pv_today') %}
+            {%- set parts = [] %}
+            {%- if d | is_number %}{%- set parts = parts + ['Solar today ' ~ (d | float | round(1)) ~ ' kWh'] %}{%- endif %}
+            {%- if t | is_number %}{%- set parts = parts + ['tomorrow ' ~ (t | float | round(1)) ~ ' kWh'] %}{%- endif %}
+            {%- set parts = parts + ['Predbat: ' ~ (states('predbat.status') if has_value('predbat.status') else 'not running')] %}
+            {{ parts | join(' · ') }}
+          color: >-
+            {{ '#00897B' if is_state('input_select.bexie_battery_mode', 'Charging') and is_state('binary_sensor.octopus_free_hour', 'on')
+               else '#1565C0' if is_state('input_select.bexie_battery_mode', 'Charging')
+               else '#6A1B9A' if is_state('input_select.bexie_battery_mode', 'Holding')
+               else '#4527A0' if is_state('input_select.bexie_battery_mode', 'Floor')
+               else '#5D4037' if is_state('input_boolean.bexie_auto_control', 'off')
+               else '#2E7D32' if state_attr('predbat.best_charge_start', 'timestamp')
+               else '#37474F' }}
+          stale: "{{ ((as_timestamp(now()) - as_timestamp(state_attr('predbat.status', 'last_updated'), 0)) / 60) | round(0) > 30 }}"

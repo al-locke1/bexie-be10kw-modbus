@@ -1,0 +1,816 @@
+# =============================================================================
+# BEXIE INVERTER MONITOR  ·  Save as /config/packages/bexie_monitor.yaml   (12 Nov 2026)
+#
+# Watches the inverter's own settings and how the battery is actually charging,
+# using the register map in docs/registers.md (from the generic "Modbus Protocol
+# V1.2" document). Read only: nothing here writes to the inverter.
+#
+# BEFORE YOU USE THIS
+#   - Needs the ha-solarman integration with the Bexie profile. Entity names here
+#     are the ones that profile creates with the device named "Inverter"
+#     (sensor.inverter_battery_soc, select.inverter_work_mode and so on).
+#   - The "known-good" values (the exp dictionary, repeated in each template) are
+#     from one BE10KW-1PH system. Change them to match yours.
+#   - Alerts go through script.house_notify (fields: title, message, tag) and the
+#     notify service named in input_text.security_notify_service. Replace both
+#     with your own notification.
+#   - input_select.bexie_battery_mode comes from predbat_bexie.yaml.
+#   - The 5 kW / 10 kW max charge values and the 00:30-05:30 window are specific
+#     to this system's car charging and tariff.
+#
+# sensor.inverter_settings
+#   Every 15 minutes (and at start-up) reads the inverter's battery, charge, meter
+#   and AC-coupling settings, the capacity mode (SOC or voltage), firmware versions,
+#   inverter mode and error codes. It also keeps register 0x2001 (the generic map calls it
+#   battery temperature, but on this Bexie it doesn't match the app's battery
+#   temperature, so it's recorded for reference only and not alerted on).
+#   State = how many settings differ from the known-good values. Attributes:
+#   values, differences from expected, what changed since the last read (not
+#   counting register 0x2001 or the car's 5 kW limit), read time.
+#   The settings HA itself controls (work mode, grid charge, charge target, the
+#   car's 5 kW limit) are left out of the comparison.
+#   Fire event bexie_monitor_refresh (Developer tools > Events) to read it now.
+#
+# Checks (binary_sensor.check_*, so they show in sensor.system_checks too), each
+# with a phone alert when it turns on and when it clears:
+#   check_inverter_settings      a setting differs from the known-good value
+#   check_inverter_fault         the inverter reports a battery/backup fault bit (0x2013,
+#                                decoded), an inverter/grid/meter error code, or Fault mode
+#   check_battery_not_charging   daytime, Self Use, battery under 95%, exporting
+#                                800 W+ while the battery takes under 300 W, 15 min
+#   check_grid_charge_slow       grid charging but the battery takes under 2.5 kW
+#                                and is 3%+ short of the target, 15 min
+#
+# Urgent alerts:
+#   - a setting changes between two reads (e.g. a remote change by Bexie): straight
+#     away, with old and new values;
+#   - the inverter goes offline while it was grid charging (00:30-05:30, or the
+#     battery bridge was Charging/Holding): HA can't stop the charge at 05:30, so it
+#     may keep charging and running the house from the grid at the day rate.
+#     Repeated at 05:35 if it is still offline.
+#
+# sensor.battery_overnight_charge: the night's peak charge rate and kWh gained,
+# kept for 14 nights, so it's easy to see whether a fix has worked.
+# =============================================================================
+template:
+  # --------------------------------------------------------- inverter settings
+  - triggers:
+      - trigger: time_pattern
+        minutes: "/15"
+      - trigger: homeassistant
+        event: start
+      - trigger: event
+        event_type: bexie_monitor_refresh
+    actions:
+      # at start-up give the inverter link a moment
+      - if:
+          - condition: template
+            value_template: "{{ trigger.platform == 'homeassistant' }}"
+        then:
+          - delay: "00:01:30"
+      - action: solarman.read_holding_registers
+        data:
+          device: "{{ device_id('sensor.inverter_battery_soc') }}"
+          address: 8448
+          count: 81
+        response_variable: r1
+        continue_on_error: true
+      - action: solarman.read_holding_registers
+        data:
+          device: "{{ device_id('sensor.inverter_battery_soc') }}"
+          address: 8192
+          count: 28
+        response_variable: r2
+        continue_on_error: true
+      - action: solarman.read_holding_registers
+        data:
+          device: "{{ device_id('sensor.inverter_battery_soc') }}"
+          address: 6681
+          count: 82
+        response_variable: r3
+        continue_on_error: true
+      - action: solarman.read_holding_registers
+        data:
+          device: "{{ device_id('sensor.inverter_battery_soc') }}"
+          address: 12464
+          count: 11
+        response_variable: r4
+        continue_on_error: true
+      - action: solarman.read_holding_registers
+        data:
+          device: "{{ device_id('sensor.inverter_battery_soc') }}"
+          address: 4125
+          count: 4
+        response_variable: r5
+        continue_on_error: true
+    sensor:
+      - name: Inverter settings
+        unique_id: bexie_inverter_settings
+        icon: mdi:cog-transfer-outline
+        unit_of_measurement: differences
+        state: >-
+          {%- set nsr = namespace(g={}, b={}, p={}, m={}) %}
+          {%- if r1 is defined and r1 is mapping %}{% for k, x in r1.items() %}{% set nsr.g = dict(nsr.g, **{k | string: x}) %}{% endfor %}{% endif %}
+          {%- if r2 is defined and r2 is mapping %}{% for k, x in r2.items() %}{% set nsr.b = dict(nsr.b, **{k | string: x}) %}{% endfor %}{% endif %}
+          {%- if r3 is defined and r3 is mapping %}{% for k, x in r3.items() %}{% set nsr.p = dict(nsr.p, **{k | string: x}) %}{% endfor %}{% endif %}
+          {%- if r4 is defined and r4 is mapping %}{% for k, x in r4.items() %}{% set nsr.m = dict(nsr.m, **{k | string: x}) %}{% endfor %}{% endif %}
+          {%- set nse = namespace(e={}) %}
+          {%- if r5 is defined and r5 is mapping %}{% for k, x in r5.items() %}{% set nse.e = dict(nse.e, **{k | string: x}) %}{% endfor %}{% endif %}
+          {%- set g, b, p, m, er = nsr.g, nsr.b, nsr.p, nsr.m, nse.e %}
+          {%- set nsf = namespace(fw='', ems='') %}
+          {%- for a in range(6681, 6704) %}{% set x = p.get(a | string, 0) | int(0) %}{% for c in [x // 256, x % 256] %}{% if 32 <= c < 127 %}{% set nsf.fw = nsf.fw ~ ('%c' | format(c)) %}{% endif %}{% endfor %}{% endfor %}
+          {%- for a in range(6752, 6762) %}{% set x = p.get(a | string, 0) | int(0) %}{% for c in [x // 256, x % 256] %}{% if 32 <= c < 127 %}{% set nsf.ems = nsf.ems ~ ('%c' | format(c)) %}{% endif %}{% endfor %}{% endfor %}
+          {%- set ok = g.get('8464') is not none %}
+          {%- set t = b.get('8193') %}
+          {%- set v = {
+            'battery_type': g.get('8464'),
+            'bms_address': g.get('8465'),
+            'lead_acid_ah': g.get('8466'),
+            'lead_acid_stop_discharge_v': (g.get('8467') / 10) if g.get('8467') is number else none,
+            'lead_acid_stop_charge_v': (g.get('8468') / 10) if g.get('8468') is number else none,
+            'max_grid_charge_w': g.get('8470'),
+            'max_charge_w': g.get('8472'),
+            'charge_end_pct': g.get('8473'),
+            'max_discharge_w': g.get('8474'),
+            'discharge_end_pct': g.get('8475'),
+            'off_grid': g.get('8476'),
+            'off_grid_startup_pct': g.get('8479'),
+            'max_discharge_a': (g.get('8480') / 100) if g.get('8480') is number else none,
+            'max_charge_a': (g.get('8481') / 100) if g.get('8481') is number else none,
+            'capacity_mode': g.get('8484'),
+            'max_grid_input_w': g.get('8485'),
+            'inverter_off_soc_pct': g.get('8505'),
+            'force_charge_start_soc_pct': g.get('8516'),
+            'force_charge_end_soc_pct': g.get('8517'),
+            'grid_charge_end_battery_v': (g.get('8520') / 10) if g.get('8520') is number else none,
+            'feed_in_grid': g.get('8521'),
+            'max_grid_forced_charge_w': g.get('8528'),
+            'production_type': p.get('6746'),
+            'firmware_block': nsf.fw if p else none,
+            'ems_firmware': nsf.ems if p else none,
+            'meter_type': m.get('12465'),
+            'power_limit_function': m.get('12467'),
+            'meter_location': m.get('12469'),
+            'max_feed_in_w': ((m.get('12473') | int(0)) * 65536 + (m.get('12474') | int(0))) if m.get('12474') is number else none,
+            'inverter_mode': er.get('4125'),
+            'error_code_1': er.get('4126'),
+            'error_code_2': er.get('4127'),
+            'error_code_3': er.get('4128'),
+            'battery_error_bits': b.get('8211'),
+            'reg_0x2016_soh_unconfirmed': b.get('8214'),
+            'reg_0x2001_unconfirmed': ((t - 65536) if t is number and t > 32767 else t),
+          } %}
+          {%- set exp = {
+            'battery_type': 31, 'bms_address': 1, 'lead_acid_stop_charge_v': 53.2,
+            'max_grid_charge_w': 10000, 'charge_end_pct': 100, 'max_discharge_w': 10000,
+            'discharge_end_pct': 15, 'off_grid': 1, 'off_grid_startup_pct': 25,
+            'max_discharge_a': 210.0, 'max_charge_a': 210.0, 'production_type': 3,
+            'meter_type': 15, 'meter_location': 0, 'feed_in_grid': 1, 'power_limit_function': 3,
+          } %}
+          {%- set ns = namespace(diff=[]) %}
+          {%- if ok %}
+            {%- for k, e in exp.items() if v[k] is not none and v[k] != e %}
+              {%- set ns.diff = ns.diff + [k ~ ' is ' ~ v[k] ~ ' (expected ' ~ e ~ ')'] %}
+            {%- endfor %}
+            {%- if v.max_charge_w is number and v.max_charge_w not in [5000, 10000] %}
+              {%- set ns.diff = ns.diff + ['max_charge_w is ' ~ v.max_charge_w ~ ' (expected 10000, or 5000 while the car charges)'] %}
+            {%- endif %}
+          {%- endif %}
+          {{ ns.diff | count if ok else this.state }}
+        attributes:
+          values: >-
+            {%- set nsr = namespace(g={}, b={}, p={}, m={}) %}
+            {%- if r1 is defined and r1 is mapping %}{% for k, x in r1.items() %}{% set nsr.g = dict(nsr.g, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r2 is defined and r2 is mapping %}{% for k, x in r2.items() %}{% set nsr.b = dict(nsr.b, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r3 is defined and r3 is mapping %}{% for k, x in r3.items() %}{% set nsr.p = dict(nsr.p, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r4 is defined and r4 is mapping %}{% for k, x in r4.items() %}{% set nsr.m = dict(nsr.m, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- set nse = namespace(e={}) %}
+            {%- if r5 is defined and r5 is mapping %}{% for k, x in r5.items() %}{% set nse.e = dict(nse.e, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- set g, b, p, m, er = nsr.g, nsr.b, nsr.p, nsr.m, nse.e %}
+            {%- set nsf = namespace(fw='', ems='') %}
+            {%- for a in range(6681, 6704) %}{% set x = p.get(a | string, 0) | int(0) %}{% for c in [x // 256, x % 256] %}{% if 32 <= c < 127 %}{% set nsf.fw = nsf.fw ~ ('%c' | format(c)) %}{% endif %}{% endfor %}{% endfor %}
+            {%- for a in range(6752, 6762) %}{% set x = p.get(a | string, 0) | int(0) %}{% for c in [x // 256, x % 256] %}{% if 32 <= c < 127 %}{% set nsf.ems = nsf.ems ~ ('%c' | format(c)) %}{% endif %}{% endfor %}{% endfor %}
+            {%- set ok = g.get('8464') is not none %}
+            {%- set t = b.get('8193') %}
+            {%- set v = {
+              'battery_type': g.get('8464'),
+              'bms_address': g.get('8465'),
+              'lead_acid_ah': g.get('8466'),
+              'lead_acid_stop_discharge_v': (g.get('8467') / 10) if g.get('8467') is number else none,
+              'lead_acid_stop_charge_v': (g.get('8468') / 10) if g.get('8468') is number else none,
+              'max_grid_charge_w': g.get('8470'),
+              'max_charge_w': g.get('8472'),
+              'charge_end_pct': g.get('8473'),
+              'max_discharge_w': g.get('8474'),
+              'discharge_end_pct': g.get('8475'),
+              'off_grid': g.get('8476'),
+              'off_grid_startup_pct': g.get('8479'),
+              'max_discharge_a': (g.get('8480') / 100) if g.get('8480') is number else none,
+              'max_charge_a': (g.get('8481') / 100) if g.get('8481') is number else none,
+              'capacity_mode': g.get('8484'),
+              'max_grid_input_w': g.get('8485'),
+              'inverter_off_soc_pct': g.get('8505'),
+              'force_charge_start_soc_pct': g.get('8516'),
+              'force_charge_end_soc_pct': g.get('8517'),
+              'grid_charge_end_battery_v': (g.get('8520') / 10) if g.get('8520') is number else none,
+              'feed_in_grid': g.get('8521'),
+              'max_grid_forced_charge_w': g.get('8528'),
+              'production_type': p.get('6746'),
+              'firmware_block': nsf.fw if p else none,
+              'ems_firmware': nsf.ems if p else none,
+              'meter_type': m.get('12465'),
+              'power_limit_function': m.get('12467'),
+              'meter_location': m.get('12469'),
+              'max_feed_in_w': ((m.get('12473') | int(0)) * 65536 + (m.get('12474') | int(0))) if m.get('12474') is number else none,
+              'inverter_mode': er.get('4125'),
+              'error_code_1': er.get('4126'),
+              'error_code_2': er.get('4127'),
+              'error_code_3': er.get('4128'),
+              'battery_error_bits': b.get('8211'),
+              'reg_0x2016_soh_unconfirmed': b.get('8214'),
+              'reg_0x2001_unconfirmed': ((t - 65536) if t is number and t > 32767 else t),
+            } %}
+            {%- set exp = {
+              'battery_type': 31, 'bms_address': 1, 'lead_acid_stop_charge_v': 53.2,
+              'max_grid_charge_w': 10000, 'charge_end_pct': 100, 'max_discharge_w': 10000,
+              'discharge_end_pct': 15, 'off_grid': 1, 'off_grid_startup_pct': 25,
+              'max_discharge_a': 210.0, 'max_charge_a': 210.0, 'production_type': 3,
+              'meter_type': 15, 'meter_location': 0, 'feed_in_grid': 1, 'power_limit_function': 3,
+            } %}
+            {%- set ns = namespace(diff=[]) %}
+            {%- if ok %}
+              {%- for k, e in exp.items() if v[k] is not none and v[k] != e %}
+                {%- set ns.diff = ns.diff + [k ~ ' is ' ~ v[k] ~ ' (expected ' ~ e ~ ')'] %}
+              {%- endfor %}
+              {%- if v.max_charge_w is number and v.max_charge_w not in [5000, 10000] %}
+                {%- set ns.diff = ns.diff + ['max_charge_w is ' ~ v.max_charge_w ~ ' (expected 10000, or 5000 while the car charges)'] %}
+              {%- endif %}
+            {%- endif %}
+            {{ v if ok else this.attributes.get('values', {}) }}
+          differences: >-
+            {%- set nsr = namespace(g={}, b={}, p={}, m={}) %}
+            {%- if r1 is defined and r1 is mapping %}{% for k, x in r1.items() %}{% set nsr.g = dict(nsr.g, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r2 is defined and r2 is mapping %}{% for k, x in r2.items() %}{% set nsr.b = dict(nsr.b, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r3 is defined and r3 is mapping %}{% for k, x in r3.items() %}{% set nsr.p = dict(nsr.p, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r4 is defined and r4 is mapping %}{% for k, x in r4.items() %}{% set nsr.m = dict(nsr.m, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- set nse = namespace(e={}) %}
+            {%- if r5 is defined and r5 is mapping %}{% for k, x in r5.items() %}{% set nse.e = dict(nse.e, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- set g, b, p, m, er = nsr.g, nsr.b, nsr.p, nsr.m, nse.e %}
+            {%- set nsf = namespace(fw='', ems='') %}
+            {%- for a in range(6681, 6704) %}{% set x = p.get(a | string, 0) | int(0) %}{% for c in [x // 256, x % 256] %}{% if 32 <= c < 127 %}{% set nsf.fw = nsf.fw ~ ('%c' | format(c)) %}{% endif %}{% endfor %}{% endfor %}
+            {%- for a in range(6752, 6762) %}{% set x = p.get(a | string, 0) | int(0) %}{% for c in [x // 256, x % 256] %}{% if 32 <= c < 127 %}{% set nsf.ems = nsf.ems ~ ('%c' | format(c)) %}{% endif %}{% endfor %}{% endfor %}
+            {%- set ok = g.get('8464') is not none %}
+            {%- set t = b.get('8193') %}
+            {%- set v = {
+              'battery_type': g.get('8464'),
+              'bms_address': g.get('8465'),
+              'lead_acid_ah': g.get('8466'),
+              'lead_acid_stop_discharge_v': (g.get('8467') / 10) if g.get('8467') is number else none,
+              'lead_acid_stop_charge_v': (g.get('8468') / 10) if g.get('8468') is number else none,
+              'max_grid_charge_w': g.get('8470'),
+              'max_charge_w': g.get('8472'),
+              'charge_end_pct': g.get('8473'),
+              'max_discharge_w': g.get('8474'),
+              'discharge_end_pct': g.get('8475'),
+              'off_grid': g.get('8476'),
+              'off_grid_startup_pct': g.get('8479'),
+              'max_discharge_a': (g.get('8480') / 100) if g.get('8480') is number else none,
+              'max_charge_a': (g.get('8481') / 100) if g.get('8481') is number else none,
+              'capacity_mode': g.get('8484'),
+              'max_grid_input_w': g.get('8485'),
+              'inverter_off_soc_pct': g.get('8505'),
+              'force_charge_start_soc_pct': g.get('8516'),
+              'force_charge_end_soc_pct': g.get('8517'),
+              'grid_charge_end_battery_v': (g.get('8520') / 10) if g.get('8520') is number else none,
+              'feed_in_grid': g.get('8521'),
+              'max_grid_forced_charge_w': g.get('8528'),
+              'production_type': p.get('6746'),
+              'firmware_block': nsf.fw if p else none,
+              'ems_firmware': nsf.ems if p else none,
+              'meter_type': m.get('12465'),
+              'power_limit_function': m.get('12467'),
+              'meter_location': m.get('12469'),
+              'max_feed_in_w': ((m.get('12473') | int(0)) * 65536 + (m.get('12474') | int(0))) if m.get('12474') is number else none,
+              'inverter_mode': er.get('4125'),
+              'error_code_1': er.get('4126'),
+              'error_code_2': er.get('4127'),
+              'error_code_3': er.get('4128'),
+              'battery_error_bits': b.get('8211'),
+              'reg_0x2016_soh_unconfirmed': b.get('8214'),
+              'reg_0x2001_unconfirmed': ((t - 65536) if t is number and t > 32767 else t),
+            } %}
+            {%- set exp = {
+              'battery_type': 31, 'bms_address': 1, 'lead_acid_stop_charge_v': 53.2,
+              'max_grid_charge_w': 10000, 'charge_end_pct': 100, 'max_discharge_w': 10000,
+              'discharge_end_pct': 15, 'off_grid': 1, 'off_grid_startup_pct': 25,
+              'max_discharge_a': 210.0, 'max_charge_a': 210.0, 'production_type': 3,
+              'meter_type': 15, 'meter_location': 0, 'feed_in_grid': 1, 'power_limit_function': 3,
+            } %}
+            {%- set ns = namespace(diff=[]) %}
+            {%- if ok %}
+              {%- for k, e in exp.items() if v[k] is not none and v[k] != e %}
+                {%- set ns.diff = ns.diff + [k ~ ' is ' ~ v[k] ~ ' (expected ' ~ e ~ ')'] %}
+              {%- endfor %}
+              {%- if v.max_charge_w is number and v.max_charge_w not in [5000, 10000] %}
+                {%- set ns.diff = ns.diff + ['max_charge_w is ' ~ v.max_charge_w ~ ' (expected 10000, or 5000 while the car charges)'] %}
+              {%- endif %}
+            {%- endif %}
+            {{ ns.diff if ok else this.attributes.get('differences', []) }}
+          changes: >-
+            {%- set nsr = namespace(g={}, b={}, p={}, m={}) %}
+            {%- if r1 is defined and r1 is mapping %}{% for k, x in r1.items() %}{% set nsr.g = dict(nsr.g, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r2 is defined and r2 is mapping %}{% for k, x in r2.items() %}{% set nsr.b = dict(nsr.b, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r3 is defined and r3 is mapping %}{% for k, x in r3.items() %}{% set nsr.p = dict(nsr.p, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r4 is defined and r4 is mapping %}{% for k, x in r4.items() %}{% set nsr.m = dict(nsr.m, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- set nse = namespace(e={}) %}
+            {%- if r5 is defined and r5 is mapping %}{% for k, x in r5.items() %}{% set nse.e = dict(nse.e, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- set g, b, p, m, er = nsr.g, nsr.b, nsr.p, nsr.m, nse.e %}
+            {%- set nsf = namespace(fw='', ems='') %}
+            {%- for a in range(6681, 6704) %}{% set x = p.get(a | string, 0) | int(0) %}{% for c in [x // 256, x % 256] %}{% if 32 <= c < 127 %}{% set nsf.fw = nsf.fw ~ ('%c' | format(c)) %}{% endif %}{% endfor %}{% endfor %}
+            {%- for a in range(6752, 6762) %}{% set x = p.get(a | string, 0) | int(0) %}{% for c in [x // 256, x % 256] %}{% if 32 <= c < 127 %}{% set nsf.ems = nsf.ems ~ ('%c' | format(c)) %}{% endif %}{% endfor %}{% endfor %}
+            {%- set ok = g.get('8464') is not none %}
+            {%- set t = b.get('8193') %}
+            {%- set v = {
+              'battery_type': g.get('8464'),
+              'bms_address': g.get('8465'),
+              'lead_acid_ah': g.get('8466'),
+              'lead_acid_stop_discharge_v': (g.get('8467') / 10) if g.get('8467') is number else none,
+              'lead_acid_stop_charge_v': (g.get('8468') / 10) if g.get('8468') is number else none,
+              'max_grid_charge_w': g.get('8470'),
+              'max_charge_w': g.get('8472'),
+              'charge_end_pct': g.get('8473'),
+              'max_discharge_w': g.get('8474'),
+              'discharge_end_pct': g.get('8475'),
+              'off_grid': g.get('8476'),
+              'off_grid_startup_pct': g.get('8479'),
+              'max_discharge_a': (g.get('8480') / 100) if g.get('8480') is number else none,
+              'max_charge_a': (g.get('8481') / 100) if g.get('8481') is number else none,
+              'capacity_mode': g.get('8484'),
+              'max_grid_input_w': g.get('8485'),
+              'inverter_off_soc_pct': g.get('8505'),
+              'force_charge_start_soc_pct': g.get('8516'),
+              'force_charge_end_soc_pct': g.get('8517'),
+              'grid_charge_end_battery_v': (g.get('8520') / 10) if g.get('8520') is number else none,
+              'feed_in_grid': g.get('8521'),
+              'max_grid_forced_charge_w': g.get('8528'),
+              'production_type': p.get('6746'),
+              'firmware_block': nsf.fw if p else none,
+              'ems_firmware': nsf.ems if p else none,
+              'meter_type': m.get('12465'),
+              'power_limit_function': m.get('12467'),
+              'meter_location': m.get('12469'),
+              'max_feed_in_w': ((m.get('12473') | int(0)) * 65536 + (m.get('12474') | int(0))) if m.get('12474') is number else none,
+              'inverter_mode': er.get('4125'),
+              'error_code_1': er.get('4126'),
+              'error_code_2': er.get('4127'),
+              'error_code_3': er.get('4128'),
+              'battery_error_bits': b.get('8211'),
+              'reg_0x2016_soh_unconfirmed': b.get('8214'),
+              'reg_0x2001_unconfirmed': ((t - 65536) if t is number and t > 32767 else t),
+            } %}
+            {%- set exp = {
+              'battery_type': 31, 'bms_address': 1, 'lead_acid_stop_charge_v': 53.2,
+              'max_grid_charge_w': 10000, 'charge_end_pct': 100, 'max_discharge_w': 10000,
+              'discharge_end_pct': 15, 'off_grid': 1, 'off_grid_startup_pct': 25,
+              'max_discharge_a': 210.0, 'max_charge_a': 210.0, 'production_type': 3,
+              'meter_type': 15, 'meter_location': 0, 'feed_in_grid': 1, 'power_limit_function': 3,
+            } %}
+            {%- set ns = namespace(diff=[]) %}
+            {%- if ok %}
+              {%- for k, e in exp.items() if v[k] is not none and v[k] != e %}
+                {%- set ns.diff = ns.diff + [k ~ ' is ' ~ v[k] ~ ' (expected ' ~ e ~ ')'] %}
+              {%- endfor %}
+              {%- if v.max_charge_w is number and v.max_charge_w not in [5000, 10000] %}
+                {%- set ns.diff = ns.diff + ['max_charge_w is ' ~ v.max_charge_w ~ ' (expected 10000, or 5000 while the car charges)'] %}
+              {%- endif %}
+            {%- endif %}
+            {%- set old = this.attributes.get('values') or {} %}
+            {%- set ns2 = namespace(c=[]) %}
+            {%- if ok and old %}
+              {%- for k, x in v.items() if k in old and k not in ['reg_0x2001_unconfirmed', 'reg_0x2016_soh_unconfirmed', 'max_charge_w', 'inverter_mode', 'error_code_1', 'error_code_2', 'error_code_3', 'battery_error_bits'] and x is not none and old[k] is not none and x != old[k] %}
+                {%- set ns2.c = ns2.c + [k ~ ': ' ~ old[k] ~ ' to ' ~ x] %}
+              {%- endfor %}
+            {%- endif %}
+            {{ ns2.c }}
+          reg_0x2001_unconfirmed: >-
+            {%- set nsr = namespace(g={}, b={}, p={}, m={}) %}
+            {%- if r1 is defined and r1 is mapping %}{% for k, x in r1.items() %}{% set nsr.g = dict(nsr.g, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r2 is defined and r2 is mapping %}{% for k, x in r2.items() %}{% set nsr.b = dict(nsr.b, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r3 is defined and r3 is mapping %}{% for k, x in r3.items() %}{% set nsr.p = dict(nsr.p, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r4 is defined and r4 is mapping %}{% for k, x in r4.items() %}{% set nsr.m = dict(nsr.m, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- set nse = namespace(e={}) %}
+            {%- if r5 is defined and r5 is mapping %}{% for k, x in r5.items() %}{% set nse.e = dict(nse.e, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- set g, b, p, m, er = nsr.g, nsr.b, nsr.p, nsr.m, nse.e %}
+            {%- set nsf = namespace(fw='', ems='') %}
+            {%- for a in range(6681, 6704) %}{% set x = p.get(a | string, 0) | int(0) %}{% for c in [x // 256, x % 256] %}{% if 32 <= c < 127 %}{% set nsf.fw = nsf.fw ~ ('%c' | format(c)) %}{% endif %}{% endfor %}{% endfor %}
+            {%- for a in range(6752, 6762) %}{% set x = p.get(a | string, 0) | int(0) %}{% for c in [x // 256, x % 256] %}{% if 32 <= c < 127 %}{% set nsf.ems = nsf.ems ~ ('%c' | format(c)) %}{% endif %}{% endfor %}{% endfor %}
+            {%- set ok = g.get('8464') is not none %}
+            {%- set t = b.get('8193') %}
+            {%- set v = {
+              'battery_type': g.get('8464'),
+              'bms_address': g.get('8465'),
+              'lead_acid_ah': g.get('8466'),
+              'lead_acid_stop_discharge_v': (g.get('8467') / 10) if g.get('8467') is number else none,
+              'lead_acid_stop_charge_v': (g.get('8468') / 10) if g.get('8468') is number else none,
+              'max_grid_charge_w': g.get('8470'),
+              'max_charge_w': g.get('8472'),
+              'charge_end_pct': g.get('8473'),
+              'max_discharge_w': g.get('8474'),
+              'discharge_end_pct': g.get('8475'),
+              'off_grid': g.get('8476'),
+              'off_grid_startup_pct': g.get('8479'),
+              'max_discharge_a': (g.get('8480') / 100) if g.get('8480') is number else none,
+              'max_charge_a': (g.get('8481') / 100) if g.get('8481') is number else none,
+              'capacity_mode': g.get('8484'),
+              'max_grid_input_w': g.get('8485'),
+              'inverter_off_soc_pct': g.get('8505'),
+              'force_charge_start_soc_pct': g.get('8516'),
+              'force_charge_end_soc_pct': g.get('8517'),
+              'grid_charge_end_battery_v': (g.get('8520') / 10) if g.get('8520') is number else none,
+              'feed_in_grid': g.get('8521'),
+              'max_grid_forced_charge_w': g.get('8528'),
+              'production_type': p.get('6746'),
+              'firmware_block': nsf.fw if p else none,
+              'ems_firmware': nsf.ems if p else none,
+              'meter_type': m.get('12465'),
+              'power_limit_function': m.get('12467'),
+              'meter_location': m.get('12469'),
+              'max_feed_in_w': ((m.get('12473') | int(0)) * 65536 + (m.get('12474') | int(0))) if m.get('12474') is number else none,
+              'inverter_mode': er.get('4125'),
+              'error_code_1': er.get('4126'),
+              'error_code_2': er.get('4127'),
+              'error_code_3': er.get('4128'),
+              'battery_error_bits': b.get('8211'),
+              'reg_0x2016_soh_unconfirmed': b.get('8214'),
+              'reg_0x2001_unconfirmed': ((t - 65536) if t is number and t > 32767 else t),
+            } %}
+            {%- set exp = {
+              'battery_type': 31, 'bms_address': 1, 'lead_acid_stop_charge_v': 53.2,
+              'max_grid_charge_w': 10000, 'charge_end_pct': 100, 'max_discharge_w': 10000,
+              'discharge_end_pct': 15, 'off_grid': 1, 'off_grid_startup_pct': 25,
+              'max_discharge_a': 210.0, 'max_charge_a': 210.0, 'production_type': 3,
+              'meter_type': 15, 'meter_location': 0, 'feed_in_grid': 1, 'power_limit_function': 3,
+            } %}
+            {%- set ns = namespace(diff=[]) %}
+            {%- if ok %}
+              {%- for k, e in exp.items() if v[k] is not none and v[k] != e %}
+                {%- set ns.diff = ns.diff + [k ~ ' is ' ~ v[k] ~ ' (expected ' ~ e ~ ')'] %}
+              {%- endfor %}
+              {%- if v.max_charge_w is number and v.max_charge_w not in [5000, 10000] %}
+                {%- set ns.diff = ns.diff + ['max_charge_w is ' ~ v.max_charge_w ~ ' (expected 10000, or 5000 while the car charges)'] %}
+              {%- endif %}
+            {%- endif %}
+            {{ v.reg_0x2001_unconfirmed if ok else this.attributes.get('reg_0x2001_unconfirmed') }}
+          read_ok: >-
+            {%- set nsr = namespace(g={}, b={}, p={}, m={}) %}
+            {%- if r1 is defined and r1 is mapping %}{% for k, x in r1.items() %}{% set nsr.g = dict(nsr.g, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r2 is defined and r2 is mapping %}{% for k, x in r2.items() %}{% set nsr.b = dict(nsr.b, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r3 is defined and r3 is mapping %}{% for k, x in r3.items() %}{% set nsr.p = dict(nsr.p, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r4 is defined and r4 is mapping %}{% for k, x in r4.items() %}{% set nsr.m = dict(nsr.m, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- set nse = namespace(e={}) %}
+            {%- if r5 is defined and r5 is mapping %}{% for k, x in r5.items() %}{% set nse.e = dict(nse.e, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- set g, b, p, m, er = nsr.g, nsr.b, nsr.p, nsr.m, nse.e %}
+            {%- set nsf = namespace(fw='', ems='') %}
+            {%- for a in range(6681, 6704) %}{% set x = p.get(a | string, 0) | int(0) %}{% for c in [x // 256, x % 256] %}{% if 32 <= c < 127 %}{% set nsf.fw = nsf.fw ~ ('%c' | format(c)) %}{% endif %}{% endfor %}{% endfor %}
+            {%- for a in range(6752, 6762) %}{% set x = p.get(a | string, 0) | int(0) %}{% for c in [x // 256, x % 256] %}{% if 32 <= c < 127 %}{% set nsf.ems = nsf.ems ~ ('%c' | format(c)) %}{% endif %}{% endfor %}{% endfor %}
+            {%- set ok = g.get('8464') is not none %}
+            {%- set t = b.get('8193') %}
+            {%- set v = {
+              'battery_type': g.get('8464'),
+              'bms_address': g.get('8465'),
+              'lead_acid_ah': g.get('8466'),
+              'lead_acid_stop_discharge_v': (g.get('8467') / 10) if g.get('8467') is number else none,
+              'lead_acid_stop_charge_v': (g.get('8468') / 10) if g.get('8468') is number else none,
+              'max_grid_charge_w': g.get('8470'),
+              'max_charge_w': g.get('8472'),
+              'charge_end_pct': g.get('8473'),
+              'max_discharge_w': g.get('8474'),
+              'discharge_end_pct': g.get('8475'),
+              'off_grid': g.get('8476'),
+              'off_grid_startup_pct': g.get('8479'),
+              'max_discharge_a': (g.get('8480') / 100) if g.get('8480') is number else none,
+              'max_charge_a': (g.get('8481') / 100) if g.get('8481') is number else none,
+              'capacity_mode': g.get('8484'),
+              'max_grid_input_w': g.get('8485'),
+              'inverter_off_soc_pct': g.get('8505'),
+              'force_charge_start_soc_pct': g.get('8516'),
+              'force_charge_end_soc_pct': g.get('8517'),
+              'grid_charge_end_battery_v': (g.get('8520') / 10) if g.get('8520') is number else none,
+              'feed_in_grid': g.get('8521'),
+              'max_grid_forced_charge_w': g.get('8528'),
+              'production_type': p.get('6746'),
+              'firmware_block': nsf.fw if p else none,
+              'ems_firmware': nsf.ems if p else none,
+              'meter_type': m.get('12465'),
+              'power_limit_function': m.get('12467'),
+              'meter_location': m.get('12469'),
+              'max_feed_in_w': ((m.get('12473') | int(0)) * 65536 + (m.get('12474') | int(0))) if m.get('12474') is number else none,
+              'inverter_mode': er.get('4125'),
+              'error_code_1': er.get('4126'),
+              'error_code_2': er.get('4127'),
+              'error_code_3': er.get('4128'),
+              'battery_error_bits': b.get('8211'),
+              'reg_0x2016_soh_unconfirmed': b.get('8214'),
+              'reg_0x2001_unconfirmed': ((t - 65536) if t is number and t > 32767 else t),
+            } %}
+            {%- set exp = {
+              'battery_type': 31, 'bms_address': 1, 'lead_acid_stop_charge_v': 53.2,
+              'max_grid_charge_w': 10000, 'charge_end_pct': 100, 'max_discharge_w': 10000,
+              'discharge_end_pct': 15, 'off_grid': 1, 'off_grid_startup_pct': 25,
+              'max_discharge_a': 210.0, 'max_charge_a': 210.0, 'production_type': 3,
+              'meter_type': 15, 'meter_location': 0, 'feed_in_grid': 1, 'power_limit_function': 3,
+            } %}
+            {%- set ns = namespace(diff=[]) %}
+            {%- if ok %}
+              {%- for k, e in exp.items() if v[k] is not none and v[k] != e %}
+                {%- set ns.diff = ns.diff + [k ~ ' is ' ~ v[k] ~ ' (expected ' ~ e ~ ')'] %}
+              {%- endfor %}
+              {%- if v.max_charge_w is number and v.max_charge_w not in [5000, 10000] %}
+                {%- set ns.diff = ns.diff + ['max_charge_w is ' ~ v.max_charge_w ~ ' (expected 10000, or 5000 while the car charges)'] %}
+              {%- endif %}
+            {%- endif %}
+            {{ ok }}
+          read_at: >-
+            {%- set nsr = namespace(g={}, b={}, p={}, m={}) %}
+            {%- if r1 is defined and r1 is mapping %}{% for k, x in r1.items() %}{% set nsr.g = dict(nsr.g, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r2 is defined and r2 is mapping %}{% for k, x in r2.items() %}{% set nsr.b = dict(nsr.b, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r3 is defined and r3 is mapping %}{% for k, x in r3.items() %}{% set nsr.p = dict(nsr.p, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- if r4 is defined and r4 is mapping %}{% for k, x in r4.items() %}{% set nsr.m = dict(nsr.m, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- set nse = namespace(e={}) %}
+            {%- if r5 is defined and r5 is mapping %}{% for k, x in r5.items() %}{% set nse.e = dict(nse.e, **{k | string: x}) %}{% endfor %}{% endif %}
+            {%- set g, b, p, m, er = nsr.g, nsr.b, nsr.p, nsr.m, nse.e %}
+            {%- set nsf = namespace(fw='', ems='') %}
+            {%- for a in range(6681, 6704) %}{% set x = p.get(a | string, 0) | int(0) %}{% for c in [x // 256, x % 256] %}{% if 32 <= c < 127 %}{% set nsf.fw = nsf.fw ~ ('%c' | format(c)) %}{% endif %}{% endfor %}{% endfor %}
+            {%- for a in range(6752, 6762) %}{% set x = p.get(a | string, 0) | int(0) %}{% for c in [x // 256, x % 256] %}{% if 32 <= c < 127 %}{% set nsf.ems = nsf.ems ~ ('%c' | format(c)) %}{% endif %}{% endfor %}{% endfor %}
+            {%- set ok = g.get('8464') is not none %}
+            {%- set t = b.get('8193') %}
+            {%- set v = {
+              'battery_type': g.get('8464'),
+              'bms_address': g.get('8465'),
+              'lead_acid_ah': g.get('8466'),
+              'lead_acid_stop_discharge_v': (g.get('8467') / 10) if g.get('8467') is number else none,
+              'lead_acid_stop_charge_v': (g.get('8468') / 10) if g.get('8468') is number else none,
+              'max_grid_charge_w': g.get('8470'),
+              'max_charge_w': g.get('8472'),
+              'charge_end_pct': g.get('8473'),
+              'max_discharge_w': g.get('8474'),
+              'discharge_end_pct': g.get('8475'),
+              'off_grid': g.get('8476'),
+              'off_grid_startup_pct': g.get('8479'),
+              'max_discharge_a': (g.get('8480') / 100) if g.get('8480') is number else none,
+              'max_charge_a': (g.get('8481') / 100) if g.get('8481') is number else none,
+              'capacity_mode': g.get('8484'),
+              'max_grid_input_w': g.get('8485'),
+              'inverter_off_soc_pct': g.get('8505'),
+              'force_charge_start_soc_pct': g.get('8516'),
+              'force_charge_end_soc_pct': g.get('8517'),
+              'grid_charge_end_battery_v': (g.get('8520') / 10) if g.get('8520') is number else none,
+              'feed_in_grid': g.get('8521'),
+              'max_grid_forced_charge_w': g.get('8528'),
+              'production_type': p.get('6746'),
+              'firmware_block': nsf.fw if p else none,
+              'ems_firmware': nsf.ems if p else none,
+              'meter_type': m.get('12465'),
+              'power_limit_function': m.get('12467'),
+              'meter_location': m.get('12469'),
+              'max_feed_in_w': ((m.get('12473') | int(0)) * 65536 + (m.get('12474') | int(0))) if m.get('12474') is number else none,
+              'inverter_mode': er.get('4125'),
+              'error_code_1': er.get('4126'),
+              'error_code_2': er.get('4127'),
+              'error_code_3': er.get('4128'),
+              'battery_error_bits': b.get('8211'),
+              'reg_0x2016_soh_unconfirmed': b.get('8214'),
+              'reg_0x2001_unconfirmed': ((t - 65536) if t is number and t > 32767 else t),
+            } %}
+            {%- set exp = {
+              'battery_type': 31, 'bms_address': 1, 'lead_acid_stop_charge_v': 53.2,
+              'max_grid_charge_w': 10000, 'charge_end_pct': 100, 'max_discharge_w': 10000,
+              'discharge_end_pct': 15, 'off_grid': 1, 'off_grid_startup_pct': 25,
+              'max_discharge_a': 210.0, 'max_charge_a': 210.0, 'production_type': 3,
+              'meter_type': 15, 'meter_location': 0, 'feed_in_grid': 1, 'power_limit_function': 3,
+            } %}
+            {%- set ns = namespace(diff=[]) %}
+            {%- if ok %}
+              {%- for k, e in exp.items() if v[k] is not none and v[k] != e %}
+                {%- set ns.diff = ns.diff + [k ~ ' is ' ~ v[k] ~ ' (expected ' ~ e ~ ')'] %}
+              {%- endfor %}
+              {%- if v.max_charge_w is number and v.max_charge_w not in [5000, 10000] %}
+                {%- set ns.diff = ns.diff + ['max_charge_w is ' ~ v.max_charge_w ~ ' (expected 10000, or 5000 while the car charges)'] %}
+              {%- endif %}
+            {%- endif %}
+            {{ now().isoformat() if ok else this.attributes.get('read_at') }}
+
+  # ------------------------------------------------- overnight charge record
+  # 00:31 notes the battery level; 05:35 records the night's peak charge rate
+  # (from sensor.battery_power_low_6h) and the kWh gained. Keeps 14 nights.
+  - triggers:
+      - trigger: time
+        at: "00:31:00"
+        id: start
+      - trigger: time
+        at: "05:35:00"
+        id: end
+    sensor:
+      - name: Battery overnight charge
+        unique_id: battery_overnight_charge
+        icon: mdi:battery-clock
+        unit_of_measurement: kW
+        state: >-
+          {%- set low = states('sensor.battery_power_low_6h') | float(none) %}
+          {{ ((-low / 1000) | round(1)) if trigger.id == 'end' and low is not none else this.state }}
+        attributes:
+          start_soc: >-
+            {{ states('sensor.inverter_battery_soc') | int(none) if trigger.id == 'start' else this.attributes.get('start_soc') }}
+          history: >-
+            {%- set old = this.attributes.get('history') or [] %}
+            {%- if trigger.id == 'end' %}
+              {%- set low = states('sensor.battery_power_low_6h') | float(0) %}
+              {%- set s0 = this.attributes.get('start_soc') %}
+              {%- set s1 = states('sensor.inverter_battery_soc') | int(none) %}
+              {{ (old + [{'date': now().date() | string,
+                           'peak_kw': ((-low / 1000) | round(1)),
+                           'soc_start': s0, 'soc_end': s1,
+                           'gained_pct': (s1 - s0) if s0 is number and s1 is number else none}])[-14:] }}
+            {%- else %}{{ old }}{% endif %}
+
+  # --------------------------------------------------------------- checks
+  - binary_sensor:
+      - name: Check inverter settings
+        unique_id: check_inverter_settings
+        device_class: problem
+        icon: mdi:cog-off-outline
+        state: "{{ states('sensor.inverter_settings') | int(0) > 0 }}"
+        attributes:
+          title: Inverter settings changed
+          message: >-
+            {{ (state_attr('sensor.inverter_settings', 'differences') or []) | join('; ') }}.
+            Something other than Home Assistant has changed the inverter (HA never writes these).
+            If it wasn't Bexie, check the Bexie app.
+
+      - name: Check inverter fault
+        unique_id: check_inverter_fault
+        device_class: problem
+        icon: mdi:alert-octagon-outline
+        state: >-
+          {%- set v = state_attr('sensor.inverter_settings', 'values') or {} %}
+          {{ (v.get('battery_error_bits') or 0) | int(0) > 0 or (v.get('error_code_1') or 0) | int(0) > 0
+             or (v.get('error_code_2') or 0) | int(0) > 0 or (v.get('error_code_3') or 0) | int(0) > 0
+             or (v.get('inverter_mode') is number and v.get('inverter_mode') == 5) }}
+        attributes:
+          title: Inverter reporting a fault
+          message: >-
+            {%- set v = state_attr('sensor.inverter_settings', 'values') or {} %}
+            {%- set bits = (v.get('battery_error_bits') or 0) | int(0) %}
+            {%- set names = ['battery absent', 'battery over voltage', 'battery under voltage', 'battery discharge over current',
+                             'battery over temperature', 'battery under temperature', 'neutral and live reversed', 'backup output voltage abnormal',
+                             'inverter-BMS communication error', 'internal communication loss (E-M)', 'internal communication loss (M-D)', 'DCDC abnormal',
+                             'backup DC bias', 'backup short circuit', 'backup overload', 'reserved'] %}
+            {%- set ns = namespace(f=[]) %}
+            {%- for i in range(16) if (bits // (2 ** i)) % 2 == 1 %}{% set ns.f = ns.f + [names[i]] %}{% endfor %}
+            {%- if ns.f %}Battery/backup: {{ ns.f | join(', ') }}. {% endif %}
+            {%- if (v.get('error_code_1') or 0) | int(0) or (v.get('error_code_2') or 0) | int(0) or (v.get('error_code_3') or 0) | int(0) %}Inverter error codes 1/2/3: {{ v.get('error_code_1') }}/{{ v.get('error_code_2') }}/{{ v.get('error_code_3') }} (inverter, grid/PV, logger/meter tables). {% endif %}
+            {%- if v.get('inverter_mode') == 5 %}Inverter mode: Fault.{% endif %}
+            Check the Bexie app's logs.
+
+      - name: Check battery not charging
+        unique_id: check_battery_not_charging
+        device_class: problem
+        icon: mdi:battery-alert-variant-outline
+        state: >-
+          {{ is_state('sun.sun', 'above_horizon')
+             and is_state('select.inverter_work_mode', 'Self Use')
+             and states('sensor.inverter_battery_soc') | float(100) < 95
+             and states('sensor.inverter_grid_power') | float(0) < -800
+             and states('sensor.inverter_battery_power') | float(0) > -300 }}
+        delay_on: "00:15:00"
+        delay_off: "00:05:00"
+        attributes:
+          title: Battery not taking spare solar
+          message: >-
+            {%- set v = states('sensor.inverter_battery_voltage') | float(0) %}
+            {%- set la = (state_attr('sensor.inverter_settings', 'values') or {}).get('lead_acid_stop_charge_v') %}
+            The battery is at {{ states('sensor.inverter_battery_soc') }}% and taking only {{ [-(states('sensor.inverter_battery_power') | float(0)), 0] | max | round(0) }} W,
+            while {{ (-(states('sensor.inverter_grid_power') | float(0))) | round(0) }} W goes to the grid. Battery voltage {{ v }} V
+            {%- if la is number and (v - la) | abs <= 0.3 %}, right at the {{ la }} V lead-acid stop-charge setting{% endif %}.
+
+      - name: Check grid charge slow
+        unique_id: check_grid_charge_slow
+        device_class: problem
+        icon: mdi:battery-charging-low
+        state: >-
+          {{ is_state('select.inverter_work_mode', 'Back-up')
+             and is_state('switch.inverter_grid_charge', 'on')
+             and states('sensor.inverter_battery_soc') | float(100) < states('number.inverter_grid_charge_end_soc') | float(0) - 3
+             and states('sensor.inverter_battery_power') | float(0) > -2500 }}
+        delay_on: "00:15:00"
+        delay_off: "00:05:00"
+        attributes:
+          title: Battery grid charging slowly
+          message: >-
+            Grid charging to {{ states('number.inverter_grid_charge_end_soc') }}%, but the battery is taking only
+            {{ [-(states('sensor.inverter_battery_power') | float(0)), 0] | max | round(0) }} W
+            ({{ states('sensor.inverter_battery_current') }} A at {{ states('sensor.inverter_battery_voltage') }} V, {{ states('sensor.inverter_battery_soc') }}%).
+            It normally takes 5-10 kW.
+
+sensor:
+  # lowest battery power (most negative = fastest charge) over the last 6 hours
+  - platform: statistics
+    name: Battery power low 6h
+    unique_id: battery_power_low_6h
+    entity_id: sensor.inverter_battery_power
+    state_characteristic: value_min
+    max_age:
+      hours: 6
+    sampling_size: 5000
+
+automation:
+  - id: bexie_monitor_check_alert
+    alias: Bexie monitor - check alert
+    mode: queued
+    max: 10
+    triggers:
+      - trigger: state
+        entity_id:
+          - binary_sensor.check_inverter_settings
+          - binary_sensor.check_inverter_fault
+          - binary_sensor.check_battery_not_charging
+          - binary_sensor.check_grid_charge_slow
+        from: ["off", "on"]
+        to: ["on", "off"]
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.from_state.state != trigger.to_state.state }}"
+    actions:
+      - action: script.turn_on
+        target:
+          entity_id: script.house_notify
+        data:
+          variables:
+            title: "{{ ('Check: ' if trigger.to_state.state == 'on' else 'Cleared: ') ~ trigger.to_state.attributes.title }}"
+            message: >-
+              {%- if trigger.to_state.state == 'on' %}{{ trigger.to_state.attributes.message | trim }}
+              {%- else %}This has sorted itself out ({{ now().strftime('%H:%M') }}).{% endif %}
+            tag: "{{ trigger.entity_id | replace('binary_sensor.', '') }}"
+        continue_on_error: true
+
+  # A setting changed between two reads: say what, straight away.
+  - id: bexie_settings_changed
+    alias: Bexie monitor - inverter setting changed
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: sensor.inverter_settings
+        attribute: changes
+    conditions:
+      - condition: template
+        value_template: "{{ (trigger.to_state.attributes.changes or []) | count > 0 }}"
+    actions:
+      - action: script.turn_on
+        target:
+          entity_id: script.house_notify
+        data:
+          variables:
+            title: Inverter setting changed
+            message: >-
+              At {{ now().strftime('%H:%M') }}: {{ trigger.to_state.attributes.changes | join('; ') }}.
+              Home Assistant doesn't write these, so this was done from the Bexie app or remotely.
+            tag: bexie-settings-changed
+        continue_on_error: true
+
+  # Inverter offline while it was grid charging: it can't be stopped at 05:30.
+  - id: bexie_offline_while_charging
+    alias: Bexie monitor - inverter offline while grid charging
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.inverter_connection
+        to: "off"
+        for: "00:05:00"
+        id: offline
+      - trigger: time
+        at: "05:35:00"
+        id: reminder
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ not is_state('binary_sensor.inverter_connection', 'on')
+             and (states('input_select.bexie_battery_mode') in ['Charging', 'Holding']
+                  or '00:25' <= now().strftime('%H:%M') < '05:40') }}
+    actions:
+      - variables:
+          svc: "{{ states('input_text.security_notify_service') | replace('notify.', '') | trim }}"
+      - condition: template
+        value_template: "{{ svc not in ['', 'unknown', 'unavailable'] }}"
+      - action: "notify.{{ svc }}"
+        data:
+          title: Inverter offline while grid charging
+          message: >-
+            {%- if trigger.id == 'reminder' %}Still offline at 05:35, so Home Assistant couldn't end the night charge.
+            {%- else %}Home Assistant lost the inverter at {{ (now() - timedelta(minutes=5)).strftime('%H:%M') }} while it was grid charging.{% endif %}
+            It may stay in Back-up with grid charge on, charging and running the house from the grid at the day rate.
+            Restart the inverter's link, or set Self Use with grid charge off in the Bexie app.
+          data:
+            tag: bexie-offline-charging
+            priority: high
+            ttl: 0
+        continue_on_error: true
