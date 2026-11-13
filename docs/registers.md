@@ -1,6 +1,6 @@
 # Bexie BE10KW-1PH: Modbus register reference
 
-Last updated November 2026.
+Last updated 13 November 2026.
 
 **Source map:** the Bexie follows the generic "APD" hybrid protocol, [Modbus Protocol V1.2](https://sunvec.es/wp-content/uploads/2023/05/Modbus-Protocol-V1.2.pdf). That document is the base reference. This page records what was confirmed on a live unit and where the Bexie differs.
 
@@ -32,18 +32,21 @@ Last updated November 2026.
 | 0x1A49-0x1A4D | 6729 | *undocumented* | 4170, 4770, 800, 988, 980 |
 | 0x1A58 | 6744 | *undocumented* | 652 |
 | 0x1A5A | 6746 | Production type. Generic doc: 1 = AC couple without smart load, 4 = AC couple with smart load. | 3. This is not where the AC coupled mode setting is stored. |
-| 0x1A60 (10) | 6752 | EMS firmware, ASCII | "01120010004-06260119" |
+| 0x1A60 (10) | 6752 | EMS firmware, ASCII. The EMS is the inverter's management and communications board. | "01140310004-07261008" (see firmware notes below) |
 
 ### Firmware strings
 
-The 0x1A19-0x1A2F block reads as two strings: master, then slave/DCDC.
+The 0x1A19-0x1A2F block reads as two strings: master, then slave/DCDC. The EMS firmware is separate, at 0x1A60.
 
-| When | Master | Slave/DCDC |
-|---|---|---|
-| Before 12 Nov 2026 | 01100110000-05260123 | 01120010001-06260119 |
-| After remote updates on 12 Nov 2026 | 01120110000-06260917 | 01140110001-07260917 |
+| When | Master | Slave/DCDC | EMS |
+|---|---|---|---|
+| Before 12 Nov 2026 | 01100110000-05260123 | 01120010001-06260119 | 01120010004-06260119 |
+| After remote updates on 12 Nov 2026 | 01120110000-06260917 | 01140110001-07260917 | unchanged |
+| After remote update on 13 Nov 2026 | unchanged | unchanged | 01140310004-07261008 |
 
-The inverter dropped offline for a few minutes around each update, and the work mode was rewritten after the master update. Polling this block is a simple way to know when the manufacturer has pushed new firmware.
+The inverter dropped off local Modbus for a few minutes around each update, and the work mode was rewritten after the master update. Polling these blocks is a simple way to know when the manufacturer has pushed new firmware.
+
+Compare against a fixed known-good version as well as the previous reading. A check that only looks for a change since the last read will miss an update if Home Assistant restarts while the inverter is offline.
 
 ## Real-time data (read-only)
 
@@ -77,8 +80,8 @@ The inverter dropped offline for a few minutes around each update, and the work 
 | Reg | Dec | Meaning | Observed |
 |---|---|---|---|
 | 0x2000 | 8192 | SOC % | Matches the Bexie app |
-| 0x2001 | 8193 | "Battery temperature" in the generic doc. **Not usable on this model.** | Read 0, then 65506 (-30) after a firmware update, while the app showed 6 to 8 C |
-| 0x2002 | 8194 | *undocumented*, likely BMS status | 192 or 193. The app's "BMS Status" shows 192. |
+| 0x2001 | 8193 | "Battery temperature" in the generic doc. **Not usable on this model.** | Read 0 before 12 Nov 2026, 65506 (-30) under the 12 Nov firmware, and 0 again after the 13 Nov EMS update, while the app showed 6 to 8 C throughout |
+| 0x2002 | 8194 | *undocumented*, likely BMS status | 192 or 193 before the 13 Nov 2026 EMS update (the app's "BMS Status" showed 192), 65 after it |
 | 0x2006 | 8198 | Battery voltage, 0.1 V | Matches the app |
 | 0x2007 (S32) | 8199 | Battery current, 0.01 A | 1000 = 10 A, matches the app |
 | 0x2009 (S32) | 8201 | Battery power, 0.1 W | Matches the app |
