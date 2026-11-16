@@ -65,7 +65,7 @@ If you know how the heating is triggered, please open an issue.
 - **Alerts:** a "slow charging" alert based on a fixed power threshold will fire on cold nights. Take battery temperature into account, or expect it.
 - **Fault alerts:** the under-temperature bit will raise any alert that treats 0x2013 as a fault. Consider handling bit 5 separately.
 - **Charge planning:** a planner that assumes the full charge rate will fall short in a short cheap-rate window when the battery is near freezing. On 14 November this system could add only about 2 kW.
-- **Fault-finding:** compare like with like. A low rate on a cold night and a full rate on a mild night can come from the same healthy system.
+- **Fault-finding:** compare like with like. A low rate on a cold night and a full rate on a mild night can come from the same healthy system. The [case study](slow-charging-case-study.md) shows how this muddied a real fault.
 
 ## Sources
 

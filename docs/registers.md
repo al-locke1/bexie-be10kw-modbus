@@ -130,7 +130,7 @@ Bit 5 is a protection state, not a hardware fault. It goes with the reduced char
 | 0x2120 / 0x2121 | 8480 / 8481 | Max discharge / charge current, 0.01 A | 21000 / 21000 |
 | 0x2122 | 8482 | GEN port | 0 |
 | 0x2123 | 8483 | Lithium activation | 0 |
-| 0x2124 | 8484 | **Capacity mode: 0 = SOC %, 1 = battery voltage** | 0. Switching the battery type to lead-acid and back to lithium leaves this at 1, so check it afterwards. |
+| 0x2124 | 8484 | **Capacity mode: 0 = SOC %, 1 = battery voltage** | 0. Switching the battery type to lead-acid and back to lithium leaves this at 1, so check it afterwards. See the [case study](slow-charging-case-study.md). |
 | 0x2125 | 8485 | Max input power from grid, W | 10000 |
 | 0x2126-0x212A | 8486 | Generator settings | 10000, 10000, 0, 80, 100 |
 | 0x212B-0x212D | 8491 | Smart load: min PV W, on SOC, off SOC | 500, 100, 80 |
