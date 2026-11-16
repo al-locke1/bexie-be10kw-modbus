@@ -9,6 +9,7 @@ Working notes from running a Bexie BE10KW-1PH hybrid inverter with Bexie low-vol
 | File | What it covers |
 |---|---|
 | [docs/registers.md](docs/registers.md) | Register reference: device info, live data, battery, hybrid settings, meter, grid code. Includes values observed on a live unit and registers that are not in the generic protocol document. |
+| [docs/cold-weather-charging.md](docs/cold-weather-charging.md) | Observed charge current against battery temperature, from about 40 A near freezing to the full 185 A above 10 C, and what is and is not known about the battery heating. |
 | [docs/home-assistant.md](docs/home-assistant.md) | How the inverter is connected to Home Assistant, how to read and write registers, and what is worth monitoring. |
 | [home-assistant/packages/bexie_monitor.yaml](home-assistant/packages/bexie_monitor.yaml) | Read-only Home Assistant package that checks the inverter's settings, firmware and faults every 15 minutes and alerts on any change. |
 | [home-assistant/packages/predbat_bexie.yaml](home-assistant/packages/predbat_bexie.yaml) | Home Assistant package that lets Predbat control the Bexie through the three profile controls, with safety nets. |
@@ -18,7 +19,9 @@ Working notes from running a Bexie BE10KW-1PH hybrid inverter with Bexie low-vol
 - The BE10KW-1PH follows the generic "APD" hybrid inverter Modbus protocol (V1.2), with some Bexie-specific values and several registers the generic document does not describe.
 - It works with the [ha-solarman](https://github.com/davidrapan/ha-solarman) integration using the community Bexie profile from [netmindz/ha-solarman, branch `bexie_be`](https://github.com/netmindz/ha-solarman/tree/bexie_be). That profile was written for the BE6KW-1PH, so the 10 kW model does not autodetect and the profile has to be selected by hand.
 - Register 0x2124 (capacity mode) decides whether the inverter manages the battery by state of charge or by voltage. In voltage mode the charge stops at the lead-acid stop charge voltage in 0x2114, which is far too low for a lithium battery. If the battery type is ever switched to lead-acid and back to lithium, check that capacity mode has returned to 0.
-- Register 0x2001 is documented as battery temperature but is not usable on this model.
+- Register 0x2001 is documented as battery temperature but is not usable on this model. Undocumented register 0x201B looks like the real battery temperature.
+- The battery limits its own charge current when cold: about 40 A at 1 to 3 C, about 130 A at 8 to 10 C, and the full 185 A (10 kW) above 10 C. Check the temperature before treating slow charging as a fault.
+- PV total input power (0x1048) goes slightly negative at dawn and dusk, so it must be read as signed.
 - Firmware updates pushed remotely by the manufacturer can be seen by watching the firmware strings at 0x1A19 to 0x1A2F.
 
 ## Warnings

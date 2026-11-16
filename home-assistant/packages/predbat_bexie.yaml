@@ -24,6 +24,9 @@
 # again pattern inside the cheap window, which only adds losses and wear.
 # From the day rate the normal rules apply (Self Use, floors), and the guard
 # still lets go 10 minutes into the day rate.
+# 15 Nov 2026: an Octopus free hour counts as cheap too (the rate sensor still shows
+# the day rate then), so the battery never runs the house or the car while the grid
+# is free.
 #
 # Nothing here acts until input_boolean.bexie_auto_control ("Predbat controls the
 # battery") is turned on. Turn it off at any time to take manual control.
@@ -156,7 +159,7 @@ script:
                and lim >= 10 and soc > lim + 2 }}
           # cheap import: the battery may charge or rest, but never runs the house
           rate_now: "{{ states('sensor.octopus_import_rate') | float(-1) }}"
-          cheap: "{{ (rate_now < 20) if rate_now >= 0 else ('00:30' <= now().strftime('%H:%M') < '05:30') }}"
+          cheap: "{{ is_state('binary_sensor.octopus_free_hour', 'on') or ((rate_now < 20) if rate_now >= 0 else ('00:30' <= now().strftime('%H:%M') < '05:30')) }}"
           # (a guard "stop" is a safety fallback, e.g. Predbat stalled, so it still goes to normal running)
           cheap_take: "{{ cheap and ((src == 'predbat' and cmd == 'stop') or floor_hold) }}"
           eff: "{{ 'hold' if (car_take or cheap_take) else 'floor' if floor_hold else cmd }}"

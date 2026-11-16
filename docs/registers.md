@@ -1,6 +1,6 @@
 # Bexie BE10KW-1PH: Modbus register reference
 
-Last updated 13 November 2026.
+Last updated 16 November 2026.
 
 **Source map:** the Bexie follows the generic "APD" hybrid protocol, [Modbus Protocol V1.2](https://sunvec.es/wp-content/uploads/2023/05/Modbus-Protocol-V1.2.pdf). That document is the base reference. This page records what was confirmed on a live unit and where the Bexie differs.
 
@@ -44,7 +44,7 @@ The 0x1A19-0x1A2F block reads as two strings: master, then slave/DCDC. The EMS f
 | After remote updates on 12 Nov 2026 | 01120110000-06260917 | 01140110001-07260917 | unchanged |
 | After remote update on 13 Nov 2026 | unchanged | unchanged | 01140310004-07261008 |
 
-The inverter dropped off local Modbus for a few minutes around each update, and the work mode was rewritten after the master update. Polling these blocks is a simple way to know when the manufacturer has pushed new firmware.
+The inverter dropped off local Modbus around each update (about 10 minutes for the EMS update, during which it stayed on-grid), and the work mode was rewritten after the master update. Polling these blocks is a simple way to know when the manufacturer has pushed new firmware.
 
 Compare against a fixed known-good version as well as the previous reading. A check that only looks for a change since the last read will miss an update if Home Assistant restarts while the inverter is offline.
 
@@ -62,7 +62,7 @@ Compare against a fixed known-good version as well as the previous reading. A ch
 | 0x1023 (U32) | 4131 | Total generation time, h |
 | 0x1027 (U32) | 4135 | Today PV energy, Wh |
 | 0x1037 (S32) | 4151 | Grid total active power, 0.1 W |
-| 0x1048 (U32) | 4168 | PV total input power, 0.1 W |
+| 0x1048 (S32) | 4168 | PV total input power, 0.1 W. The generic document says unsigned, but at dawn and dusk the inverter reports slightly negative values (raw 0xFFFFFF6A = -15.0 W). Read as unsigned, that becomes 429,496,714 W. Read it as signed, or clamp it to 0 to 15 kW. The daily energy total (0x1027) is not affected. |
 | 0x1300 / 0x1302 / 0x1304 (S32) | 4864 | Grid power per phase, 0.1 W (positive = import) |
 | 0x1306 / 0x1308 (U32) | 4870 | Total import / export, 10 Wh |
 | 0x130A (U32) | 4874 | Load power L1, 0.1 W |
@@ -80,8 +80,8 @@ Compare against a fixed known-good version as well as the previous reading. A ch
 | Reg | Dec | Meaning | Observed |
 |---|---|---|---|
 | 0x2000 | 8192 | SOC % | Matches the Bexie app |
-| 0x2001 | 8193 | "Battery temperature" in the generic doc. **Not usable on this model.** | Read 0 before 12 Nov 2026, 65506 (-30) under the 12 Nov firmware, and 0 again after the 13 Nov EMS update, while the app showed 6 to 8 C throughout |
-| 0x2002 | 8194 | *undocumented*, likely BMS status | 192 or 193 before the 13 Nov 2026 EMS update (the app's "BMS Status" showed 192), 65 after it |
+| 0x2001 | 8193 | "Battery temperature" in the generic doc. **Not usable on this model.** | Read 0 before 12 Nov 2026, 65506 (-30) under the 12 Nov firmware, and 0 again since the 13 Nov EMS update, while the real temperature ranged from 1 to 19 C. Use 0x201B instead. |
+| 0x2002 | 8194 | *undocumented*, likely BMS status | Normally 192 or 193 (the app's "BMS Status" shows 192). Read 65 once, straight after an EMS firmware update with the battery at 100%, then back to 192. Looks like a status bit field. Meaning unknown. |
 | 0x2006 | 8198 | Battery voltage, 0.1 V | Matches the app |
 | 0x2007 (S32) | 8199 | Battery current, 0.01 A | 1000 = 10 A, matches the app |
 | 0x2009 (S32) | 8201 | Battery power, 0.1 W | Matches the app |
@@ -89,9 +89,9 @@ Compare against a fixed known-good version as well as the previous reading. A ch
 | 0x200D (U32) | 8205 | Total charge, 10 Wh | Matches the app |
 | 0x200F (U32) | 8207 | Today discharge, 10 Wh | |
 | 0x2011 (U32) | 8209 | Total discharge, 10 Wh | |
-| 0x2013 | 8211 | Error message 4: battery and backup fault bits (below) | 0 |
+| 0x2013 | 8211 | Error message 4: battery and backup fault bits (below) | Normally 0. Read 32 (bit 5, under temperature) with the battery at 1 C, and cleared as it warmed. The bit table works on this model. |
 | 0x2016 | 8214 | *undocumented*, possibly SOH % | 100 |
-| 0x201B | 8219 | *undocumented* | 4 to 9, varies |
+| 0x201B | 8219 | *undocumented*. Battery temperature in C, likely: it read 5, 2 and 8 when Home Assistant's battery temperature showed 5, 2 and 8. | 1 to 19 |
 
 **0x2013 bits:**
 
@@ -105,6 +105,8 @@ Compare against a fixed known-good version as well as the previous reading. A ch
 | 5 | Under temperature | 13 | Backup short circuit |
 | 6 | Neutral/live reversed | 14 | Backup overload |
 | 7 | Backup voltage abnormal | | |
+
+Bit 5 is a protection state, not a hardware fault. It goes with the reduced charge current described in [cold-weather-charging.md](cold-weather-charging.md).
 
 ## Hybrid settings (0x2100 block, read/write)
 
@@ -185,6 +187,9 @@ Registers written successfully on this system: 0x2100, 0x2115, 0x2117, 0x2118, 0
 - What 0x211F (off-grid start-up SOC) does when a Gecko gateway is fitted: no backup below that level, or the restart level after a flat battery.
 - Where the off-grid discharge cut-off is set.
 - Where the AC coupled mode setting is stored.
+- How the battery heating film is triggered, and whether any register controls or reports it.
+- The BMS charge current limit between 0 and 10 C.
+- Whether the Gecko gateway has a Modbus map of its own.
 - The meaning of the undocumented registers above.
 
 If you know any of these, please open an issue.
